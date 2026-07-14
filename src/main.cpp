@@ -207,6 +207,13 @@ RTC_DATA_ATTR float  weatherWindSpeed = 0;
 RTC_DATA_ATTR int    weatherWindDir = 0;     // degrees, 0-359
 RTC_DATA_ATTR bool   haveWeather = false;
 RTC_DATA_ATTR int    wakesSinceWeatherFetch = 999; // force a fetch on first real wake
+// ---- NEW 2026-07-14: city name for the Weather screen, resolved from ----
+// zipCode via zippopotam.us (US only, no API key). Piggybacks on the
+// same WiFi connection as fetchWeather(), same fetch-then-replace
+// semantics as the Torah Quotes CSV: a failed lookup keeps whatever
+// city name was last successfully resolved rather than blanking it.
+RTC_DATA_ATTR char   cityName[32] = "";
+RTC_DATA_ATTR bool   haveCityName = false;
 #define FORECAST_DAYS 6
 RTC_DATA_ATTR int forecastCode[FORECAST_DAYS];
 RTC_DATA_ATTR int forecastTempMax[FORECAST_DAYS];
@@ -287,6 +294,35 @@ void wakeLogAppend(const String& line) {
 // data/torah_quotes.csv; this fetch just pulls that committed file.
 #define TORAH_CSV_PATH "/torah_quotes.csv"
 #define TORAH_CSV_URL "https://raw.githubusercontent.com/asam26/shaon/main/data/torah_quotes.csv"
+
+// ---- BUG FIX 2026-07-14: strip Unicode curly quotes Hebcal sends in ----
+// English holiday titles (e.g. "Tisha B\u2019Av" using U+2019, the
+// right single quotation mark, 3-byte UTF-8 sequence 0xE2 0x80 0x99 --
+// confirmed this is what Hebcal's own site uses for this and similar
+// names, not a plain ASCII apostrophe). u8g2Fonts.print() correctly
+// UTF-8-decodes that 3-byte sequence into one codepoint, but the stock
+// English fonts used for holiday names (the "_tf" family) only cover
+// Basic Latin (0x20-0x7E) -- U+2019 falls outside that range, so u8g2
+// silently draws nothing for it, which is why the apostrophe in names
+// like "Tisha B'Av" was disappearing entirely rather than rendering as
+// a box or being visibly wrong. Fix: normalize both curly-quote
+// variants (U+2018 left, U+2019 right) down to a plain ASCII "'" right
+// after fetching, in place, on any Hebcal English text field that might
+// contain one.
+void normalizeApostrophes(char* s) {
+  char* src = s; char* dst = s;
+  while (*src) {
+    unsigned char c0 = (unsigned char)src[0];
+    if (c0 == 0xE2 && (unsigned char)src[1] == 0x80 &&
+        ((unsigned char)src[2] == 0x99 || (unsigned char)src[2] == 0x98)) {
+      *dst++ = '\'';
+      src += 3;
+    } else {
+      *dst++ = *src++;
+    }
+  }
+  *dst = '\0';
+}
 
 // ---- Hebrew RTL helpers ----
 String reverseUTF8(const char* str) {
@@ -375,6 +411,38 @@ void epochToLocalHM(time_t trueUtcEpoch, int *outHour, int *outMin) {
   struct tm tmv; gmtime_r(&shifted, &tmv);
   *outHour = tmv.tm_hour;
   *outMin  = tmv.tm_min;
+}
+// ---- BUG FIX 2026-07-14: local-calendar-date helper that does NOT ----
+// depend on localtime_r()/the system TZ. root cause of the "halachic
+// time frozen at aleph:aleph all night" bug: configTime() (which sets
+// the TZ used by localtime_r) is only ever called inside
+// attemptInitialDataFetch() -- i.e. only on fresh boot or a !haveData
+// retry. On an ORDINARY sunset-rollover wake (haveData already true,
+// the normal nightly case), no configTime() call has happened yet this
+// boot cycle, because deep sleep resets all normal RAM (including the
+// TZ env var) and only RTC_DATA_ATTR survives. So localtime_r(&tomorrow,
+// &tt) at the rollover block was computing "tomorrow"'s calendar date
+// against an unconfigured (effectively UTC) offset instead of true
+// local time -- during evening hours in a negative-UTC-offset timezone,
+// this can select a calendar date a day too far ahead, so fetchZmanim()
+// fetched a sunrise ~24h farther in the future than the real one.
+// computeHalachicTime()'s night-branch elapsed calc (nightLen -
+// (sunriseEpoch - now)) then stays negative and clamps to 0 for the
+// entire real night, rendering as hour 1 / minute 0 (aleph:aleph) the
+// whole time -- exactly matching the reported symptom. English mode is
+// unaffected because epochToWallClockTime()/epochToLocalHM() above
+// already use this same manual-shift + gmtime_r approach and never
+// touch localtime_r at all.
+// Fix: reuse the same manual GMT_OFFSET_SEC+DST_OFFSET_SEC shift +
+// gmtime_r() pattern (already proven reliable elsewhere in this file)
+// for calendar-date extraction too, so it no longer depends on
+// configTime() having been called this boot cycle.
+void epochToLocalYMD(time_t trueUtcEpoch, int *outY, int *outM, int *outD) {
+  time_t shifted = trueUtcEpoch + GMT_OFFSET_SEC + DST_OFFSET_SEC;
+  struct tm tmv; gmtime_r(&shifted, &tmv);
+  *outY = tmv.tm_year + 1900;
+  *outM = tmv.tm_mon + 1;
+  *outD = tmv.tm_mday;
 }
 String formatWallClockHebrew(time_t trueUtcEpoch) {
   if (trueUtcEpoch <= 0) return "—";
@@ -830,6 +898,39 @@ int computeTodayDayOfWeek(time_t nowUTC) {
   return weekday0to6 + 1; // 1=Sunday .. 7=Saturday
 }
 
+// ---- NEW 2026-07-14: real ADC-based battery reading, OFF by default ----
+// readBatteryPct() below has never actually measured battery voltage --
+// despite BATT_ADC_PIN being #defined, it was completely unused. The
+// existing method is a pure time-based GUESS: it assumes 100% whenever
+// USB was last seen connected, then linearly decays over
+// ASSUMED_BATTERY_LIFE_SECONDS with no real measurement backing it up
+// at all, which is exactly why the percentage/behavior looked
+// untrustworthy.
+// This function reads the real battery voltage via BATT_ADC_PIN and
+// maps it to a percentage via a simple linear LiPo curve. It is NOT
+// enabled by default (BATTERY_USE_ADC starts at 0) because
+// BATTERY_DIVIDER_RATIO below is an UNVERIFIED placeholder (a common
+// value for a simple 1:1 resistor divider) -- using the wrong ratio
+// would silently produce a confidently-wrong percentage, which is worse
+// than the current honest (labeled) approximation. Flip
+// BATTERY_USE_ADC to 1 only after confirming the real ratio against a
+// multimeter reading on actual hardware (see chat for how to do this).
+#define BATTERY_USE_ADC 0
+#define BATTERY_DIVIDER_RATIO 2.0f   // TODO-VERIFY against real hardware
+#define BATTERY_EMPTY_V 3.3f         // typical LiPo "empty" cutoff
+#define BATTERY_FULL_V  4.2f         // typical LiPo "full" charge
+int readBatteryPctFromVoltage() {
+  int mv = analogReadMilliVolts(BATT_ADC_PIN);
+  float voltage = (mv / 1000.0f) * BATTERY_DIVIDER_RATIO;
+  float frac = (voltage - BATTERY_EMPTY_V) / (BATTERY_FULL_V - BATTERY_EMPTY_V);
+  if (frac < 0) frac = 0;
+  if (frac > 1) frac = 1;
+  int pct = (int)(frac * 100.0f);
+  Serial.printf("Battery (ADC): raw %dmV -> %.2fV (ratio %.2f) -> %d%%\n",
+    mv, voltage, BATTERY_DIVIDER_RATIO, pct);
+  return pct;
+}
+
 int readBatteryPct() {
   pinMode(USB_DET_PIN, INPUT);
   bool usbConnected = (digitalRead(USB_DET_PIN) == 1);
@@ -843,6 +944,9 @@ int readBatteryPct() {
     return 100;
   }
 
+#if BATTERY_USE_ADC
+  return readBatteryPctFromVoltage();
+#else
   if (wasUsbConnected) {
     Serial.println("Battery: USB just disconnected -- starting discharge countdown from now");
     lastUsbConnectedEpoch = now;
@@ -862,6 +966,7 @@ int readBatteryPct() {
   Serial.printf("Battery: %.1f hours since USB disconnected -> estimated %d%%\n",
     elapsedSec / 3600.0, pct);
   return pct;
+#endif
 }
 
 bool isCharging() {
@@ -1082,6 +1187,7 @@ bool fetchNextHoliday(int gy,int gm,int gd, time_t nowUTC) {
           nextHolidayY = hy; nextHolidayM = hm; nextHolidayD = hd;
           strncpy(nextHolidayHebrew, heb ? heb : "", sizeof(nextHolidayHebrew)-1);
           strncpy(nextHolidayEn, titleEn ? titleEn : "", sizeof(nextHolidayEn)-1);
+          normalizeApostrophes(nextHolidayEn);
           haveNextHoliday = true;
         }
       }
@@ -1095,6 +1201,7 @@ bool fetchNextHoliday(int gy,int gm,int gd, time_t nowUTC) {
           nextCandleEpoch = itemEpoch;
           const char* memo = item["memo"];
           strncpy(nextCandleMemo, memo ? memo : "", sizeof(nextCandleMemo)-1);
+          normalizeApostrophes(nextCandleMemo);
           haveNextCandle = true;
         }
       }
@@ -1134,6 +1241,44 @@ int daysUntilNextHoliday(time_t nowUTC) {
   time_t holidayEpoch = utcTmToEpoch(nextHolidayY, nextHolidayM, nextHolidayD, 0, 0, 0);
   double diffDays = (double)(holidayEpoch - nowUTC) / 86400.0;
   return (int)ceil(diffDays);
+}
+
+// ---- NEW 2026-07-14: resolve zip -> city/state via zippopotam.us ----
+// (US only, free, no API key). Called from fetchWeather() below, right
+// after a successful weather fetch, reusing that same WiFi connection.
+// Only runs when a zip code is actually configured -- there's no
+// equivalent free reverse-lookup wired up for the GEONAMEID fallback
+// path, so that case just leaves cityName blank and the Weather screen
+// simply omits the city line (see drawWeather()).
+bool fetchCityName() {
+  if (zipCode[0] == '\0') return false;
+  HTTPClient http; char url[64];
+  snprintf(url, sizeof(url), "https://api.zippopotam.us/us/%s", zipCode);
+  http.begin(url);
+  int code = http.GET();
+  if (code != 200) { Serial.printf("City-name HTTP %d\n", code); http.end(); return false; }
+
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  DeserializationError e = deserializeJson(doc, payload);
+  if (e) { Serial.printf("City-name JSON err: %s\n", e.c_str()); return false; }
+
+  JsonArray places = doc["places"].as<JsonArray>();
+  if (places.size() == 0) return false;
+  const char* place = places[0]["place name"];
+  const char* state = places[0]["state abbreviation"];
+  if (!place) return false;
+
+  char buf[32];
+  if (state) snprintf(buf, sizeof(buf), "%s, %s", place, state);
+  else       snprintf(buf, sizeof(buf), "%s", place);
+  strncpy(cityName, buf, sizeof(cityName) - 1);
+  cityName[sizeof(cityName) - 1] = '\0';
+  haveCityName = true;
+  Serial.printf("City name resolved: %s\n", cityName);
+  return true;
 }
 
 bool fetchWeather() {
@@ -1193,6 +1338,7 @@ bool fetchWeather() {
   haveWeather = true;
   Serial.printf("Weather: %.1f%s code=%d humidity=%d%% wind=%.1fmph dir=%d\n",
     weatherTemp, tempFahrenheit ? "F" : "C", weatherCode, weatherHumidity, weatherWindSpeed, weatherWindDir);
+  fetchCityName(); // best-effort; leaves previous cached name in place on failure
   return true;
 }
 
@@ -1331,6 +1477,21 @@ void drawSyncIndicator(int cx, int cy, bool fresh){
   }
 }
 void drawBattery(int x,int y,int pct,bool charging){
+  // NOTE 2026-07-14: re: "battery bar seems to drain the wrong
+  // direction" -- as written, the fill rect is anchored at its LEFT
+  // edge (x+2) and only its RIGHT edge moves as pct shrinks, so it
+  // should empty starting from the terminal/nub side (right, x+24) and
+  // progressively reveal emptiness moving leftward, keeping the far-
+  // left sliver filled longest -- i.e. it should already drain
+  // right-to-left, which matches what you described as correct. I
+  // don't see a display.setRotation() call anywhere in this file that
+  // would flip left/right, so if it still looks backwards on real
+  // hardware, check which side the little nub (x+24) actually renders
+  // on physically -- if the nub itself appears on the LEFT of the
+  // watch face, that confirms a rotation/mirroring happening below this
+  // code (in the GxEPD2 driver setup or panel mounting), not a logic
+  // bug here, and we'd fix it at that layer instead of by flipping this
+  // math blind.
   display.drawRect(x,y,24,11,GxEPD_BLACK);
   display.fillRect(x+24,y+3,2,5,GxEPD_BLACK);
   if (pct < 0) {
@@ -1839,7 +2000,9 @@ void drawHalachicAnalog(time_t now, int battPct, bool charging) {
       else if (h12 > 12) h12 -= 12;
       char buf[3];
       snprintf(buf, sizeof(buf), "%d", h12);
-      u8g2Fonts.setFont(u8g2_font_6x10_tf);
+      // SIZE BUMP 2026-07-14: ~30% bigger per Andrew's request
+      // (u8g2_font_6x10_tf -> u8g2_font_8x13_tf: +33% width, +30% height).
+      u8g2Fonts.setFont(u8g2_font_8x13_tf);
       printPlainCentered(buf, x, y + 4);
     }
 
@@ -2097,7 +2260,11 @@ void drawCalendarInfo(time_t nowUTC) {
       captionHe = String("בעוד ") + hebrewNumeral(days) + " ימים";
       captionEn = String("in ") + String(days) + " days";
     }
-    printBilingualCentered(captionHe.c_str(), captionEn.c_str(), 100, 90, frankruhl_hebrew_12, u8g2_font_5x7_tf);
+    // SIZE BUMP 2026-07-14: English caption was noticeably smaller than
+    // its Hebrew counterpart on this page (5x7 vs frankruhl_hebrew_12) --
+    // bumped to a matching-scale monospace stock font per Andrew's
+    // request, keeping the same fixed-width aesthetic used elsewhere.
+    printBilingualCentered(captionHe.c_str(), captionEn.c_str(), 100, 90, frankruhl_hebrew_12, u8g2_font_6x12_tf);
 
     display.drawLine(8, 108, 192, 108, GxEPD_BLACK);
     printBilingualCentered("הדלקת נרות הבאה", "NEXT CANDLE LIGHTING", 100, 124,
@@ -2140,7 +2307,8 @@ void drawCalendarInfo(time_t nowUTC) {
           // Regular Shabbat -- show "Shabbat"/"שבת" rather than the
           // specific parasha name.
           if (languageEnglish) {
-            u8g2Fonts.setFont(u8g2_font_5x7_tf);
+            // SIZE BUMP 2026-07-14, matching the caption bump above.
+            u8g2Fonts.setFont(u8g2_font_6x12_tf);
             printPlainCentered("Shabbat", 100, 140);
           } else {
             u8g2Fonts.setFont(frankruhl_hebrew_12);
@@ -2154,14 +2322,14 @@ void drawCalendarInfo(time_t nowUTC) {
           // this specific case -- a smaller, clearly-scoped remaining
           // gap distinct from the regular-Shabbat case above.
           String occasionEn = String("for ") + memo;
-          u8g2Fonts.setFont(u8g2_font_5x7_tf);
+          u8g2Fonts.setFont(u8g2_font_6x12_tf);
           printPlainCentered(occasionEn.c_str(), 100, 140);
         }
       }
 
       u8g2Fonts.setFont(languageEnglish ? u8g2_font_helvB12_tf : frankruhl_hebrew_18);
       printPlainCentered(timeStr.c_str(), 100, 164);
-      printBilingualCentered(dayLabelHe.c_str(), dayLabelEn.c_str(), 100, 184, frankruhl_hebrew_12, u8g2_font_5x7_tf);
+      printBilingualCentered(dayLabelHe.c_str(), dayLabelEn.c_str(), 100, 184, frankruhl_hebrew_12, u8g2_font_6x12_tf);
     } else {
       printBilingualCentered("אין נתונים", "no data", 100, 152, frankruhl_hebrew_12, u8g2_font_5x7_tf);
     }
@@ -2334,10 +2502,39 @@ void drawTorahQuotes(time_t nowUTC) {
 static const char* HEBREW_WEEKDAY[7] = {"א׳","ב׳","ג׳","ד׳","ה׳","ו׳","שבת"};
 static const char* ENGLISH_WEEKDAY[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
 
+// ============================================================
+// REDESIGNED 2026-07-14 per Andrew's request:
+//  - Added a city-name line (resolved from zipCode via
+//    fetchCityName()/zippopotam.us -- see that function's own
+//    comments), shown right under the header divider.
+//  - Humidity/wind values+labels, forecast weekday labels, and
+//    forecast temps all bumped from u8g2_font_5x7_tf to
+//    u8g2_font_6x12_tf for readability (Hebrew fonts on this screen
+//    were already close to this size, so this also balances the two
+//    languages against each other better than before).
+//  - The "6-DAY FORECAST"/"תחזית שבועית" title line was removed
+//    entirely per Andrew's request; that freed vertical space (plus
+//    the room freed by moving the humidity/wind row up slightly) went
+//    toward the larger forecast fonts below and a touch more breathing
+//    room around the weekday row.
+// NOTE: Y-coordinates here are a first-pass estimate reasoned from the
+// previous layout's measurements, not yet confirmed on real hardware --
+// expect this screen specifically to need one real on-device look and
+// a possible small offset tweak, same as every other spacing pass this
+// project has gone through.
+// ============================================================
 void drawWeather() {
   display.fillScreen(GxEPD_WHITE);
   printBilingualCentered("מזג אוויר", "WEATHER", 100, 24, frankruhl_hebrew_18, u8g2_font_helvB12_tf);
   display.drawLine(8, 36, 192, 36, GxEPD_BLACK);
+
+  // City name (from zip, via fetchCityName()) -- a proper noun, so it's
+  // shown as-is regardless of language mode, same convention as the zip
+  // code / WiFi SSID display in Settings not being translated either.
+  if (haveCityName && cityName[0] != '\0') {
+    u8g2Fonts.setFont(u8g2_font_5x7_tf);
+    printPlainCentered(cityName, 100, 48);
+  }
 
   if (!haveWeather) {
     printBilingualCentered("אין נתונים", "No data yet", 100, 100, frankruhl_hebrew_12, u8g2_font_5x7_tf);
@@ -2348,12 +2545,12 @@ void drawWeather() {
   }
 
   WeatherIconCat cat = weatherCodeToIcon(weatherCode);
-  drawWeatherIcon(cat, 44, 70, 22);
+  drawWeatherIcon(cat, 44, 78, 20);
 
   char tempBuf[8];
   snprintf(tempBuf, sizeof(tempBuf), "%d\xB0", (int)round(weatherTemp));
   u8g2Fonts.setFont(u8g2_font_helvB18_tf);
-  printPlainCentered(tempBuf, 118, 78);
+  printPlainCentered(tempBuf, 118, 86);
 
   char humNum[8], windNum[24];
   snprintf(humNum, sizeof(humNum), "%d%%", weatherHumidity);
@@ -2362,25 +2559,17 @@ void drawWeather() {
     char humBuf[16], windBuf[28];
     snprintf(humBuf, sizeof(humBuf), "HUMIDITY %s", humNum);
     snprintf(windBuf, sizeof(windBuf), "WIND %s", windNum);
-    u8g2Fonts.setFont(u8g2_font_5x7_tf);
-    u8g2Fonts.setCursor(12, 108); u8g2Fonts.print(humBuf);
-    u8g2Fonts.setCursor(110, 108); u8g2Fonts.print(windBuf);
+    u8g2Fonts.setFont(u8g2_font_6x12_tf);
+    int humW = u8g2Fonts.getUTF8Width(humBuf);
+    int windW = u8g2Fonts.getUTF8Width(windBuf);
+    const int groupGap = 16;
+    int totalW = humW + groupGap + windW;
+    int startX = 100 - totalW / 2;
+    u8g2Fonts.setCursor(startX, 122); u8g2Fonts.print(humBuf);
+    u8g2Fonts.setCursor(startX + humW + groupGap, 122); u8g2Fonts.print(windBuf);
   } else {
-    // REBUILT 2026-07-13 per Andrew's feedback: the numeric value now
-    // sits to the LEFT of its Hebrew label (e.g. "73% לחות" reading
-    // left-to-right), matching natural RTL flow -- previously the
-    // value was placed to the RIGHT of the label (i.e., after it in
-    // left-to-right terms), which read backwards. The whole combined
-    // line (humidity pair + gap + wind pair) is now CENTERED on the
-    // screen as one unit, rather than left-anchored starting at x=12.
-    //
-    // Layout built by measuring every piece's real width via
-    // getUTF8Width() first, then computing a horizontal center offset
-    // for the whole assembly -- avoids the earlier bug class of
-    // guessing fixed pixel offsets that were never actually measured.
-    // ADJUSTMENT 2026-07-13: pairGap increased from 3px to 8px per
-    // Andrew's feedback that the numeric value and its Hebrew label
-    // were too close together.
+    // Same left-of-label RTL layout as before, just measured/drawn with
+    // the bigger 6x12 numeric font instead of 5x7.
     const int pairGap = 8;     // px between a value and its own label
     const int groupGap = 20;   // px between the humidity pair and the wind pair
     u8g2Fonts.setFont(frankruhl_hebrew_12);
@@ -2389,72 +2578,43 @@ void drawWeather() {
     int humLabelW = u8g2Fonts.getUTF8Width(humLabel.c_str());
     int windLabelW = u8g2Fonts.getUTF8Width(windLabel.c_str());
 
-    u8g2Fonts.setFont(u8g2_font_5x7_tf);
+    u8g2Fonts.setFont(u8g2_font_6x12_tf);
     int humNumW = u8g2Fonts.getUTF8Width(humNum);
     int windNumW = u8g2Fonts.getUTF8Width(windNum);
 
     int humPairW = humNumW + pairGap + humLabelW;
     int windPairW = windNumW + pairGap + windLabelW;
     int totalW = humPairW + groupGap + windPairW;
-    int startX = 100 - totalW / 2; // center the whole line on the 200px-wide screen
+    int startX = 100 - totalW / 2;
 
-    // Humidity pair: value, then label immediately to its right.
-    u8g2Fonts.setFont(u8g2_font_5x7_tf);
-    u8g2Fonts.setCursor(startX, 108); u8g2Fonts.print(humNum);
+    u8g2Fonts.setFont(u8g2_font_6x12_tf);
+    u8g2Fonts.setCursor(startX, 122); u8g2Fonts.print(humNum);
     u8g2Fonts.setFont(frankruhl_hebrew_12);
-    u8g2Fonts.setCursor(startX + humNumW + pairGap, 108); u8g2Fonts.print(humLabel);
+    u8g2Fonts.setCursor(startX + humNumW + pairGap, 122); u8g2Fonts.print(humLabel);
 
-    // Wind pair: value, then label immediately to its right.
     int windPairStartX = startX + humPairW + groupGap;
-    u8g2Fonts.setFont(u8g2_font_5x7_tf);
-    u8g2Fonts.setCursor(windPairStartX, 108); u8g2Fonts.print(windNum);
+    u8g2Fonts.setFont(u8g2_font_6x12_tf);
+    u8g2Fonts.setCursor(windPairStartX, 122); u8g2Fonts.print(windNum);
     u8g2Fonts.setFont(frankruhl_hebrew_12);
-    u8g2Fonts.setCursor(windPairStartX + windNumW + pairGap, 108); u8g2Fonts.print(windLabel);
+    u8g2Fonts.setCursor(windPairStartX + windNumW + pairGap, 122); u8g2Fonts.print(windLabel);
   }
 
-  // ADJUSTMENT 2026-07-13: compressed the divider above the forecast
-  // section (was y=122, now y=118) to free up vertical room, per
-  // Andrew's explicit suggestion to compress the section above if
-  // needed. That freed-up space is applied directly to widen the gap
-  // between the forecast title and the weekday row below it (was 16px,
-  // now 24px), per Andrew's specific request that this gap needed more
-  // room. Icon/temp rows shifted down by the same net amount to
-  // preserve their own relative spacing to the weekday row -- all
-  // values re-verified to still fit within the 200px screen height and
-  // stay clear of each other (icon at y=172 r=9 spans 163-181, with 7px
-  // clearance above the weekday label at 156 and 15px clearance before
-  // the temp row at 196).
-  display.drawLine(8, 118, 192, 118, GxEPD_BLACK);
+  display.drawLine(8, 134, 192, 134, GxEPD_BLACK);
 
-  if (languageEnglish) {
-    u8g2Fonts.setFont(u8g2_font_5x7_tf);
-    u8g2Fonts.setCursor(12, 132);
-    u8g2Fonts.print("6-DAY FORECAST");
-  } else {
-    // Right-justified in Hebrew mode, per Andrew's request -- was
-    // previously left-anchored via printHebrewLeft, which looked
-    // visually inconsistent with the rest of the RTL layout on this
-    // screen.
-    u8g2Fonts.setFont(frankruhl_hebrew_12);
-    printHebrewRight("תחזית שבועית", 188, 132);
-  }
-
-  // ADJUSTMENT 2026-07-13: all four Y positions shifted down by 4px as
-  // part of freeing up room for a wider title-to-weekday gap above (see
-  // the divider/title Y changes just above) -- the icon stays centered
-  // in the visual gap between the weekday label's bottom and the
-  // temperature's top, just at the new shifted positions.
-  int weekdayY = 156;
-  int iconY = 172;
-  int iconR = 9;
-  int tempY = 196;
+  // "6-DAY FORECAST"/"תחזית שבועית" title removed per Andrew's request --
+  // straight to the day columns below, using the freed-up space for
+  // bigger text.
+  int weekdayY = 154;
+  int iconY = 170;
+  int iconR = 10;
+  int tempY = 192;
 
   int colW = (192 - 12) / FORECAST_DAYS;
   for (int i = 0; i < FORECAST_DAYS; i++) {
     int cx = 12 + colW * i + colW / 2;
     if (forecastWeekday[i] >= 0 && forecastWeekday[i] < 7) {
       if (languageEnglish) {
-        u8g2Fonts.setFont(u8g2_font_5x7_tf);
+        u8g2Fonts.setFont(u8g2_font_6x12_tf);
         printPlainCentered(ENGLISH_WEEKDAY[forecastWeekday[i]], cx, weekdayY);
       } else {
         u8g2Fonts.setFont(frankruhl_hebrew_12);
@@ -2465,16 +2625,12 @@ void drawWeather() {
       drawWeatherIcon(weatherCodeToIcon(forecastCode[i]), cx, iconY, iconR);
     }
     char t[6]; snprintf(t, sizeof(t), "%d\xB0", forecastTempMax[i]);
-    u8g2Fonts.setFont(u8g2_font_5x7_tf);
+    u8g2Fonts.setFont(u8g2_font_6x12_tf);
     int tw = u8g2Fonts.getUTF8Width(t);
     u8g2Fonts.setCursor(cx - tw/2, tempY);
     u8g2Fonts.print(t);
     if (i < FORECAST_DAYS - 1) {
-      // Column divider span updated to match the shifted layout above
-      // (title/weekday/icon/temp all moved as part of this round's
-      // spacing fix) -- same relative offsets from the title/temp rows
-      // as before (6px below title, 6px above temp).
-      display.drawLine(12 + colW * (i+1), 138, 12 + colW * (i+1), 190, GxEPD_BLACK);
+      display.drawLine(12 + colW * (i+1), 140, 12 + colW * (i+1), 186, GxEPD_BLACK);
     }
   }
 }
@@ -2605,6 +2761,18 @@ void drawSettings() {
   }
   int maxScroll = totalContentBottom - SETTINGS_CONTENT_BOTTOM;
   if (maxScroll < 0) maxScroll = 0;
+  // BUG FIX 2026-07-14: the Last Updated line (and its closing divider)
+  // sit below rowY[11], the last real cursor stop, and are NOT
+  // themselves cursor stops -- so the auto-scroll above, which only
+  // ever scrolls far enough to reveal whichever row the cursor is
+  // currently on, could never scroll far enough to reveal them. Once
+  // the cursor reaches the last stop (11), jump straight to maxScroll
+  // so the trailing informational lines actually become visible --
+  // confirmed this is why "Last Updated" never appeared no matter how
+  // far down Settings was scrolled.
+  if (settingsCursor == 11) {
+    scrollOffset = maxScroll;
+  }
   if (scrollOffset > maxScroll) scrollOffset = maxScroll;
   if (scrollOffset < 0) scrollOffset = 0;
 
@@ -3043,36 +3211,12 @@ void setup(){
     }
 
     if (wakeStatus & (1ULL << MENU_BTN_PIN)) {
-      // Reuses the exact hold-detection pattern already established
-      // for DOWN_BTN_PIN below: the wake event itself is edge-
-      // triggered (fires the instant the pin goes low), so detecting a
-      // hold means staying awake briefly and polling the pin directly.
-      // MENU_BTN_PIN is active-low (same ESP_EXT1_WAKEUP_ANY_LOW
-      // convention as every other button here), so "still pressed"
-      // means the pin reads LOW.
-      pinMode(MENU_BTN_PIN, INPUT_PULLUP);
-      const unsigned long MENU_HOLD_THRESHOLD_MS = 600;
-      unsigned long menuPressStart = millis();
-      while (digitalRead(MENU_BTN_PIN) == LOW &&
-             (millis() - menuPressStart) < MENU_HOLD_THRESHOLD_MS) {
-        delay(20);
-      }
-      bool menuWasHold = (millis() - menuPressStart) >= MENU_HOLD_THRESHOLD_MS;
-
-      if (menuWasHold) {
-        // Global language toggle -- works from any screen, not just
-        // Settings, per Andrew's explicit choice. Mirrors exactly what
-        // Settings row 0's hold-to-toggle already does (same prefs key,
-        // "lang"), so the two toggle paths stay in sync with each
-        // other and with NVS.
-        languageEnglish = !languageEnglish;
-        prefs.putBool("lang", languageEnglish);
-        screenChanged = true; // force a full redraw so the language change is visible immediately
-        Serial.printf("MENU (bottom-left) held -> language toggled to %s\n", languageEnglish ? "English" : "Hebrew");
-      } else {
-        forceRefreshOnly = true;
-        Serial.println("MENU (bottom-left) tapped -> forcing screen refresh");
-      }
+      // BUTTON REMAP 2026-07-14: hold-to-toggle-language moved off of
+      // MENU (bottom-left) onto DOWN (bottom-right) for screens 1-6 --
+      // see the DOWN_BTN_PIN block below. MENU is back to a simple
+      // tap-only refresh, no hold detection needed here any more.
+      forceRefreshOnly = true;
+      Serial.println("MENU (bottom-left) tapped -> forcing screen refresh");
     }
 
     if (wakeStatus & (1ULL << DOWN_BTN_PIN)) {
@@ -3084,6 +3228,24 @@ void setup(){
         delay(20);
       }
       bool wasHold = (millis() - pressStart) >= HOLD_THRESHOLD_MS;
+
+      // BUTTON REMAP 2026-07-14: on screens 1-6 (currentScreen 0-5),
+      // holding DOWN now does the global language toggle that used to
+      // live on MENU's hold. Tapping DOWN outside Settings remains a
+      // no-op, same as before this change. Screen 7 (Settings,
+      // currentScreen==6) is completely unchanged below: tap still
+      // scrolls the cursor, hold still performs that row's own action
+      // (which, on row 0, is ALSO a language toggle -- this is
+      // intentional and pre-existing, not a duplicate of this new
+      // behavior).
+      if (currentScreen != 6) {
+        if (wasHold) {
+          languageEnglish = !languageEnglish;
+          prefs.putBool("lang", languageEnglish);
+          screenChanged = true; // force a full redraw so the language change is visible immediately
+          Serial.printf("DOWN (bottom-right) held -> language toggled to %s\n", languageEnglish ? "English" : "Hebrew");
+        }
+      }
 
       if (currentScreen == 6) {
         if (wasHold) {
@@ -3123,8 +3285,8 @@ void setup(){
             startProvisioning();
             if (wifiConnect()) {
               time_t nowForFetch; time(&nowForFetch);
-              struct tm nt; localtime_r(&nowForFetch, &nt);
-              int gy = nt.tm_year+1900, gm = nt.tm_mon+1, gd = nt.tm_mday;
+              int gy, gm, gd;
+              epochToLocalYMD(nowForFetch, &gy, &gm, &gd);
               fetchZmanim(gy,gm,gd);
               fetchHebrewDate(gy,gm,gd);
               fetchOmerDay(gy,gm,gd);
@@ -3259,8 +3421,8 @@ void setup(){
     bool wifiOk = wifiConnect();
     if (wifiOk) {
       time_t tomorrow = now + 86400;
-      struct tm tt; localtime_r(&tomorrow,&tt);
-      int gy=tt.tm_year+1900, gm=tt.tm_mon+1, gd=tt.tm_mday;
+      int gy, gm, gd;
+      epochToLocalYMD(tomorrow, &gy, &gm, &gd);
       bool okZ = fetchZmanim(gy,gm,gd);
       fetchHebrewDate(gy,gm,gd);
       fetchOmerDay(gy,gm,gd);
