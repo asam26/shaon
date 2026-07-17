@@ -1508,10 +1508,31 @@ void drawBattery(int x,int y,int pct,bool charging){
     display.fillRect(cx-3, cy-1, 7, 3, GxEPD_BLACK);
   }
 }
+// BUG FIX 2026-07-17 (hypothesis, not yet confirmed against the real
+// sky -- flagging per usual practice, since this was found by tracing
+// the math rather than by direct observation): termFactor had the
+// wrong sign. For a row of half-width hw, the lit width this code
+// actually draws is (hw - termX) = hw*(1 - termFactor); as a fraction
+// of the row's full width (2*hw) that's (1 - termFactor)/2. With the
+// old `termFactor = 2*illum - 1`, that fraction simplifies to
+// `1 - illum` -- the OPPOSITE of illum. Concretely, that made a
+// near-new moon (illum near 0, e.g. the current moonFrac=0.024) render
+// as NEARLY FULLY LIT with only a thin dark sliver at one edge, and a
+// full moon (illum near 1) render as NEARLY FULLY DARK -- backwards in
+// both amount and, since the dark/light split is still one-sided per
+// row, in which edge the sliver sits on. Fixed by using
+// `termFactor = 1 - 2*illum` instead, which makes the lit fraction
+// equal illum directly: illum=0 -> termFactor=+1 -> only a hairline
+// sliver at the far edge is even eligible to be "lit" (correctly near-
+// dark); illum=1 -> termFactor=-1 -> virtually the whole width is lit
+// (correctly near-full). This also fixes the waxing/waning sweep
+// direction over the course of the month, since the old version had
+// the shaded region growing as the moon waxed toward full and
+// shrinking as it waned toward new -- the reverse of reality.
 void drawMoon(int cx,int cy,int r,float frac){
   float illum = (float)((1.0 - cos(frac * 2.0 * M_PI)) / 2.0);
   bool waxing = (frac < 0.5);
-  float termFactor = (float)(2.0 * illum - 1.0);
+  float termFactor = (float)(1.0 - 2.0 * illum);
 
   for(int yy=-r; yy<=r; yy++){
     int hw=(int)sqrt((float)(r*r - yy*yy));
@@ -2158,7 +2179,15 @@ void drawZmanimList() {
     String dateStr = String(heDay) + " " + String(heMonth);
     printHebrewLeft(dateStr.c_str(), 12, 26);
   } else {
-    u8g2Fonts.setFont(u8g2_font_5x7_tf);
+    // SIZE BUMP 2026-07-17: was u8g2_font_5x7_tf, noticeably smaller than
+    // the Hebrew mode's frankruhl_hebrew_12 corner date directly above --
+    // bumped to u8g2_font_6x12_tf, the same stock-font swap already used
+    // elsewhere in this file (see the 2026-07-14 SIZE BUMP comments) to
+    // bring 5x7 English text up to Hebrew's visual scale. Width check:
+    // longest realistic string here is ~9-10 chars (e.g. "15 Tammuz")
+    // at 6px/char (~60px), starting at x=12 -- comfortably clear of the
+    // right-anchored "ZMANIM" header before x=188.
+    u8g2Fonts.setFont(u8g2_font_6x12_tf);
     char dayBuf[4];
     snprintf(dayBuf, sizeof(dayBuf), "%d", heDayNum);
     String dateStr = String(dayBuf) + " " + String(heMonthEn);
@@ -2180,7 +2209,16 @@ void drawZmanimList() {
   const int rowCount = sizeof(rows) / sizeof(rows[0]);
   int y = 56;
   for (int i = 0; i < rowCount; i++) {
-    printBilingualRight(rows[i].he, rows[i].en, 188, y, frankruhl_hebrew_12, u8g2_font_5x7_tf);
+    // SIZE BUMP 2026-07-17: row labels' English font was u8g2_font_5x7_tf
+    // against Hebrew's frankruhl_hebrew_12 -- bumped to u8g2_font_6x12_tf,
+    // the same swap already applied elsewhere in this file. Width check:
+    // the widest label, "Earliest Mincha" (16 chars) at 6px/char is
+    // ~96px, right-anchored at x=188 (spans ~92-188) -- clear of the
+    // left-anchored time text below (widest time string well under
+    // 54px), so the two never meet mid-row. Row height (20px) already
+    // comfortably fits Hebrew's 12px-scale font, so it fits this
+    // matching-scale English font too.
+    printBilingualRight(rows[i].he, rows[i].en, 188, y, frankruhl_hebrew_12, u8g2_font_6x12_tf);
     // CHANGE 2026-07-13: English mode now shows ordinary WALL-CLOCK
     // time (the real Hebcal-computed time-of-day for each zman, e.g.
     // Sunrise really is 5:58 AM) rather than halachic-hour notation --
@@ -2191,7 +2229,9 @@ void drawZmanimList() {
     // epoch as ordinary local time. Hebrew mode keeps the halachic-hour
     // notation via epochToHalachicTime(), unchanged.
     String timeStr = languageEnglish ? epochToWallClockTime(rows[i].epoch) : epochToHalachicTime(rows[i].epoch);
-    u8g2Fonts.setFont(languageEnglish ? u8g2_font_5x7_tf : frankruhl_hebrew_12);
+    // SIZE BUMP 2026-07-17: same 5x7 -> 6x12 swap as the row label above,
+    // for the same reason (matches Hebrew's frankruhl_hebrew_12 scale).
+    u8g2Fonts.setFont(languageEnglish ? u8g2_font_6x12_tf : frankruhl_hebrew_12);
     printHebrewLeft(timeStr.c_str(), 12, y);
     y += 20;
     if (i < rowCount - 1) {
@@ -2228,7 +2268,14 @@ void drawCalendarInfo(time_t nowUTC) {
 
     String captionHe = String("יום ") + hebrewNumeral(omerDay) + " בעומר";
     String captionEn = String("Day ") + String(omerDay) + " of the Omer";
-    printBilingualCentered(captionHe.c_str(), captionEn.c_str(), 100, 96, frankruhl_hebrew_12, u8g2_font_5x7_tf);
+    // SIZE BUMP 2026-07-17: was u8g2_font_5x7_tf vs Hebrew's
+    // frankruhl_hebrew_12 -- bumped to u8g2_font_6x12_tf (the same swap
+    // used elsewhere in this file). Clearance check: baseline is y=96,
+    // the progress bar starts at barY=104 -- an 8px gap. Hebrew's own
+    // frankruhl_hebrew_12 already renders here today at that same 8px
+    // gap without collision, so a similarly-scaled 12px-cell English
+    // font fits the same gap.
+    printBilingualCentered(captionHe.c_str(), captionEn.c_str(), 100, 96, frankruhl_hebrew_12, u8g2_font_6x12_tf);
 
     int barX = 24, barY = 104, barW = 152, barH = 7;
     display.drawRect(barX, barY, barW, barH, GxEPD_BLACK);
@@ -2267,8 +2314,15 @@ void drawCalendarInfo(time_t nowUTC) {
     printBilingualCentered(captionHe.c_str(), captionEn.c_str(), 100, 90, frankruhl_hebrew_12, u8g2_font_6x12_tf);
 
     display.drawLine(8, 108, 192, 108, GxEPD_BLACK);
+    // SIZE BUMP 2026-07-17: was u8g2_font_5x7_tf -- this is the same
+    // header row as the "in X days" caption above it, which already got
+    // this exact 5x7 -> 6x12 swap on 2026-07-14 (see comment below at
+    // the occasion-line font), so this one had been missed. Clearance
+    // check: baseline y=124, next content line (Shabbat/occasion text)
+    // sits at y=140 -- 16px gap, comfortably more than the ~8px gap the
+    // Omer caption above proved sufficient for this same font swap.
     printBilingualCentered("הדלקת נרות הבאה", "NEXT CANDLE LIGHTING", 100, 124,
-                            frankruhl_hebrew_12, u8g2_font_5x7_tf);
+                            frankruhl_hebrew_12, u8g2_font_6x12_tf);
     if (haveNextCandle) {
       // CHANGE 2026-07-13: English mode now shows ordinary WALL-CLOCK
       // time for candle lighting, per Andrew's request -- this also
@@ -2331,12 +2385,18 @@ void drawCalendarInfo(time_t nowUTC) {
       printPlainCentered(timeStr.c_str(), 100, 164);
       printBilingualCentered(dayLabelHe.c_str(), dayLabelEn.c_str(), 100, 184, frankruhl_hebrew_12, u8g2_font_6x12_tf);
     } else {
-      printBilingualCentered("אין נתונים", "no data", 100, 152, frankruhl_hebrew_12, u8g2_font_5x7_tf);
+      // SIZE BUMP 2026-07-17: was u8g2_font_5x7_tf; standalone fallback
+      // message with no neighboring content on this screen, so no
+      // clearance concern.
+      printBilingualCentered("אין נתונים", "no data", 100, 152, frankruhl_hebrew_12, u8g2_font_6x12_tf);
     }
   } else {
     printBilingualCentered("לוח שנה", "CALENDAR", 100, 26, frankruhl_hebrew_18, u8g2_font_helvB12_tf);
     display.drawLine(8, 36, 192, 36, GxEPD_BLACK);
-    printBilingualCentered("אין נתוני חג", "No holiday data", 100, 100, frankruhl_hebrew_12, u8g2_font_5x7_tf);
+    // SIZE BUMP 2026-07-17: was u8g2_font_5x7_tf; standalone fallback
+    // message with no neighboring content on this screen, so no
+    // clearance concern.
+    printBilingualCentered("אין נתוני חג", "No holiday data", 100, 100, frankruhl_hebrew_12, u8g2_font_6x12_tf);
   }
 }
 
@@ -2545,12 +2605,36 @@ void drawWeather() {
   }
 
   WeatherIconCat cat = weatherCodeToIcon(weatherCode);
-  drawWeatherIcon(cat, 44, 78, 20);
 
   char tempBuf[8];
   snprintf(tempBuf, sizeof(tempBuf), "%d\xB0", (int)round(weatherTemp));
   u8g2Fonts.setFont(u8g2_font_helvB18_tf);
-  printPlainCentered(tempBuf, 118, 86);
+  int tempW = u8g2Fonts.getUTF8Width(tempBuf);
+
+  // CENTERING FIX 2026-07-17: icon and temp were previously drawn at
+  // fixed x=44 / x=118 -- a leftover from an earlier layout pass that
+  // left the icon+temp group visibly off-center (biased left of the
+  // true page center, x=100) in BOTH language modes equally, since
+  // nothing in this block branches on languageEnglish (the temperature
+  // is always plain Arabic numerals, same in Hebrew and English). Now
+  // the icon diameter + a fixed gap + the REAL measured temp text width
+  // (via getUTF8Width, so this stays centered regardless of digit count
+  // -- e.g. a negative or 3-digit temperature) are summed into one
+  // group width, and that group is centered as a whole at x=100.
+  // NOTE: named mainIconR (not iconR) -- this function separately
+  // declares its own local `iconR` further down for the 6-day forecast
+  // row icons; reusing the name caused a real "conflicting declaration"
+  // build failure (confirmed via actual compiler output), since both
+  // are in the same function scope.
+  const int mainIconR = 20;
+  const int iconTempGap = 14; // px between icon's right edge and the temp text
+  int groupW = mainIconR * 2 + iconTempGap + tempW;
+  int groupStartX = 100 - groupW / 2;
+  int iconCx = groupStartX + mainIconR;
+  int tempCx = groupStartX + mainIconR * 2 + iconTempGap + tempW / 2;
+
+  drawWeatherIcon(cat, iconCx, 78, mainIconR);
+  printPlainCentered(tempBuf, tempCx, 86);
 
   char humNum[8], windNum[24];
   snprintf(humNum, sizeof(humNum), "%d%%", weatherHumidity);
