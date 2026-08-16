@@ -59,9 +59,51 @@ RTC_DATA_ATTR char zipCode[8] = "";   // empty = not yet configured, falls back 
 RTC_DATA_ATTR float currentLatitude = 37.44;
 RTC_DATA_ATTR float currentLongitude = -122.14;
 const char* TZID = "America/Los_Angeles";
-// NTP: Pacific time. TODO: proper DST/timezone handling later.
+// NTP: these two are now used ONLY for the configTime() call inside
+// attemptInitialDataFetch(), which affects localtime_r()/the TZ env var.
+// They are NO LONGER used for any display-side epoch->local conversion --
+// see localUtcOffsetSec below. time() itself remains true UTC after NTP
+// sync regardless of what's passed here.
 const long GMT_OFFSET_SEC = -8 * 3600;
 const int  DST_OFFSET_SEC = 3600;
+
+// ---- NEW 2026-08-16: live UTC offset, learned from Hebcal ----
+// BUG FIX: every display-side epoch->local conversion in this file used to
+// add the hardcoded GMT_OFFSET_SEC + DST_OFFSET_SEC (a fixed -7h, i.e.
+// Pacific daylight time). That is a compile-time constant, so taking the
+// watch to ANY other timezone silently shifted every displayed wall-clock
+// time -- and, worse, could shift epochToLocalYMD()'s calendar-date
+// extraction across a day boundary near midnight, which is the same class
+// of failure as the 2026-07-14 "halachic time frozen at aleph:aleph"
+// bug, just arriving from a different direction. Confirmed real symptom:
+// a trip to Colorado (MDT, -6) with the zip code updated correctly still
+// rendered every time one hour off.
+//
+// The correct offset is already in the data we fetch. Hebcal's zmanim
+// endpoint returns each time as an ISO8601 string carrying the LOCATION's
+// own UTC offset (verified against Hebcal's published API docs, e.g.
+// "sunrise": "2021-03-23T06:11:00-03:00" for a Sao Paulo geonameid), and
+// parseISOToEpoch() already parses that offset out in order to normalize
+// to UTC -- it simply discarded it afterward. We now capture it into this
+// RTC_DATA_ATTR variable on every successful zmanim fetch, so Hebcal does
+// all the timezone AND daylight-saving arithmetic for us and the firmware
+// never has to know what a DST rule is.
+//
+// Default is -7h (Pacific daylight) purely so the very first render before
+// any successful fetch isn't wildly wrong; it is overwritten by the first
+// fetchZmanim() that returns an offset.
+RTC_DATA_ATTR long localUtcOffsetSec = -7 * 3600;
+
+// ---- NEW 2026-08-16: clock sanity floor ----
+// Deep sleep preserves the RTC clock, but a power loss or a hard reset
+// (BACK+UP) starts it at 0. Any time() below this floor means NTP has
+// never landed this power cycle, so EVERY epoch-derived value computed
+// from it -- calendar date, moon phase, "last synced" timestamp, battery
+// discharge elapsed time -- is garbage. Several code paths used to trust
+// time() unconditionally; this guard makes "is the clock real?" an
+// explicit, greppable question. See its call sites in setup().
+#define MIN_PLAUSIBLE_EPOCH 1767225600L   // 2026-01-01T00:00:00Z
+static bool clockIsSynced() { time_t t; time(&t); return t >= MIN_PLAUSIBLE_EPOCH; }
 
 #define WAKE_INTERVAL_SECONDS 60
 // ---- Button pins and roles (REMAPPED 2026-07-13) ----
@@ -268,16 +310,50 @@ void wakeLogAppend(const String& line) {
   if (check) {
     size_t sz = check.size();
     if (sz > LOG_MAX_BYTES) {
-      String all; all.reserve(sz);
-      while (check.available()) all += (char)check.read();
       check.close();
-      int cut = all.length() / 2;
-      while (cut < (int)all.length() && all[cut] != '\n') cut++;
-      String kept = all.substring(cut + 1);
-      File rewrite = LittleFS.open(LOG_FILE_PATH, FILE_WRITE); // truncates
-      if (rewrite) { rewrite.print(kept); rewrite.close(); }
-      Serial.printf("wakeLogAppend: log exceeded %d bytes, trimmed to %d bytes\n",
-        LOG_MAX_BYTES, (int)kept.length());
+      // BUG FIX 2026-08-16: the previous implementation slurped the ENTIRE
+      // log file into an Arduino String (up to LOG_MAX_BYTES = 200KB) and
+      // then took a ~100KB substring of it -- roughly 300KB of heap live at
+      // once, which the ESP32-S3 will not reliably hand out. Arduino's
+      // String silently TRUNCATES on a failed allocation rather than
+      // throwing, so the whole-file read could come back short, and the
+      // subsequent newline-seek + substring would then cut at an arbitrary
+      // byte offset instead of a record boundary. Confirmed symptom: a real
+      // captured log contained the spliced line
+      //   "...battPct=14860\ttimer\trollover=n/a..."
+      // i.e. one record's battPct field running straight into the next
+      // record's timestamp, with no newline between them. That corruption
+      // makes chronology unreconstructable -- exactly the thing the log
+      // exists to provide.
+      //
+      // Fixed by streaming: seek to the halfway point, discard whatever
+      // partial line we landed in the middle of, then copy the remaining
+      // COMPLETE lines one at a time into a temp file and swap it in. Peak
+      // memory is one line rather than the whole file, and the cut can only
+      // ever land on a record boundary by construction.
+      const char* logTmpPath = "/shaon_wake_log.tmp";
+      File src = LittleFS.open(LOG_FILE_PATH, FILE_READ);
+      File dst = LittleFS.open(logTmpPath, FILE_WRITE);
+      if (src && dst) {
+        size_t kept = 0;
+        src.seek(sz / 2);
+        src.readStringUntil('\n');   // discard the partial line at the cut point
+        while (src.available()) {
+          String ln = src.readStringUntil('\n');
+          ln.trim();                 // println() emits \r\n; strip the stray \r
+          if (ln.length()) { dst.println(ln); kept += ln.length() + 2; }
+        }
+        src.close();
+        dst.close();
+        LittleFS.remove(LOG_FILE_PATH);
+        LittleFS.rename(logTmpPath, LOG_FILE_PATH);
+        Serial.printf("wakeLogAppend: log exceeded %d bytes, trimmed to ~%d bytes\n",
+          LOG_MAX_BYTES, (int)kept);
+      } else {
+        if (src) src.close();
+        if (dst) dst.close();
+        Serial.println("wakeLogAppend: trim failed to open files -- leaving log as-is");
+      }
     } else {
       check.close();
     }
@@ -407,7 +483,9 @@ String hebrewNumeral(int n) {
 
 // ---- Wall-clock formatting for Screen 3 (Zmanim List) ----
 void epochToLocalHM(time_t trueUtcEpoch, int *outHour, int *outMin) {
-  time_t shifted = trueUtcEpoch + GMT_OFFSET_SEC + DST_OFFSET_SEC;
+  // MODIFIED 2026-08-16: localUtcOffsetSec (learned live from Hebcal)
+  // replaces the hardcoded GMT_OFFSET_SEC + DST_OFFSET_SEC pair.
+  time_t shifted = trueUtcEpoch + localUtcOffsetSec;
   struct tm tmv; gmtime_r(&shifted, &tmv);
   *outHour = tmv.tm_hour;
   *outMin  = tmv.tm_min;
@@ -438,7 +516,12 @@ void epochToLocalHM(time_t trueUtcEpoch, int *outHour, int *outMin) {
 // for calendar-date extraction too, so it no longer depends on
 // configTime() having been called this boot cycle.
 void epochToLocalYMD(time_t trueUtcEpoch, int *outY, int *outM, int *outD) {
-  time_t shifted = trueUtcEpoch + GMT_OFFSET_SEC + DST_OFFSET_SEC;
+  // MODIFIED 2026-08-16: localUtcOffsetSec (learned live from Hebcal)
+  // replaces the hardcoded GMT_OFFSET_SEC + DST_OFFSET_SEC pair. This one
+  // matters most: it extracts a CALENDAR DATE, so a wrong offset can push
+  // the result across a day boundary near midnight and send fetchZmanim()
+  // after the wrong day entirely.
+  time_t shifted = trueUtcEpoch + localUtcOffsetSec;
   struct tm tmv; gmtime_r(&shifted, &tmv);
   *outY = tmv.tm_year + 1900;
   *outM = tmv.tm_mon + 1;
@@ -989,18 +1072,34 @@ static time_t utcTmToEpoch(int y, int mo, int d, int h, int mi, int s) {
   return (time_t)daysSinceEpoch * 86400L + h * 3600L + mi * 60L + s;
 }
 
-time_t parseISOToEpoch(const char* iso) {
+// Sentinel meaning "this ISO string carried no UTC offset field". Real
+// offsets are bounded by roughly +/-14 hours (+/-50400 sec), so LONG_MAX
+// can never collide with a legitimate value.
+#define ISO_OFFSET_UNKNOWN 2147483647L
+
+// MODIFIED 2026-08-16: optional outOffsetSec out-parameter. The offset was
+// always being parsed here (it has to be, in order to normalize the
+// timestamp to true UTC) -- it was just discarded once used. Reporting it
+// lets fetchZmanim() learn the location's real UTC offset from Hebcal
+// instead of relying on the hardcoded Pacific constants. Passing nullptr
+// (the default) preserves the original behavior exactly, so none of the
+// existing call sites needed to change.
+time_t parseISOToEpoch(const char* iso, long* outOffsetSec = nullptr) {
   int y,mo,d,h,mi,s;
   char offSign = '+'; int offH = 0, offM = 0;
   int n = sscanf(iso, "%d-%d-%dT%d:%d:%d%c%d:%d",
                  &y,&mo,&d,&h,&mi,&s,&offSign,&offH,&offM);
-  if (n < 6) return 0;
+  if (n < 6) {
+    if (outOffsetSec) *outOffsetSec = ISO_OFFSET_UNKNOWN;
+    return 0;
+  }
   time_t utcIfFieldsWereUTC = utcTmToEpoch(y,mo,d,h,mi,s);
   long offsetSec = 0;
   if (n >= 9) {
     offsetSec = offH * 3600L + offM * 60L;
     if (offSign == '-') offsetSec = -offsetSec;
   }
+  if (outOffsetSec) *outOffsetSec = (n >= 9) ? offsetSec : ISO_OFFSET_UNKNOWN;
   return utcIfFieldsWereUTC - offsetSec;
 }
 
@@ -1062,8 +1161,28 @@ bool fetchZmanim(int gy,int gm,int gd) {
   const char* sr = doc["times"]["sunrise"];
   const char* ss = doc["times"]["sunset"];
   if (!sr || !ss){ Serial.println("Zmanim missing sunrise/sunset"); return false; }
-  sunriseEpoch = parseISOToEpoch(sr);
+  // NEW 2026-08-16: learn the location's true UTC offset (including
+  // whatever DST rule applies on this date) from Hebcal's own timestamp,
+  // rather than trusting the hardcoded Pacific constants. See
+  // localUtcOffsetSec's declaration at the top of this file for the full
+  // rationale. Only overwrite when an offset was actually present, so a
+  // malformed/offset-less response leaves the last known-good value in
+  // place rather than snapping the display to UTC.
+  long isoOffset = ISO_OFFSET_UNKNOWN;
+  sunriseEpoch = parseISOToEpoch(sr, &isoOffset);
   sunsetEpoch  = parseISOToEpoch(ss);
+  if (isoOffset != ISO_OFFSET_UNKNOWN) {
+    if (isoOffset != localUtcOffsetSec) {
+      Serial.printf("Local UTC offset CHANGED: %+ld -> %+ld sec (%.1f -> %.1f hours)\n",
+        localUtcOffsetSec, isoOffset, localUtcOffsetSec / 3600.0, isoOffset / 3600.0);
+    }
+    localUtcOffsetSec = isoOffset;
+    Serial.printf("Local UTC offset from Hebcal: %+ld sec (%.1f hours)\n",
+      localUtcOffsetSec, localUtcOffsetSec / 3600.0);
+  } else {
+    Serial.printf("Zmanim response carried no UTC offset -- keeping %+ld sec\n",
+      localUtcOffsetSec);
+  }
 
   if (!doc["location"]["latitude"].isNull() && !doc["location"]["longitude"].isNull()) {
     currentLatitude  = doc["location"]["latitude"]  | currentLatitude;
@@ -1969,7 +2088,7 @@ void drawHalachicAnalog(time_t now, int battPct, bool charging) {
     // topA +/- PI (bottom), confirmed against real sunrise/sunset test
     // values before writing this code.
     auto wallClockAngle = [&](time_t epoch) -> float {
-      time_t shifted = epoch + GMT_OFFSET_SEC + DST_OFFSET_SEC;
+      time_t shifted = epoch + localUtcOffsetSec;  // MODIFIED 2026-08-16
       struct tm tmv; gmtime_r(&shifted, &tmv);
       float secondsSinceMidnight = tmv.tm_hour * 3600.0f + tmv.tm_min * 60.0f + tmv.tm_sec;
       float frac = secondsSinceMidnight / 86400.0f;
@@ -3095,7 +3214,7 @@ void drawSettings() {
     u8g2Fonts.setCursor(12, y);
     if (lastSuccessfulUpdateEpoch > 0) {
       struct tm updTm;
-      time_t shifted = lastSuccessfulUpdateEpoch + GMT_OFFSET_SEC + DST_OFFSET_SEC;
+      time_t shifted = lastSuccessfulUpdateEpoch + localUtcOffsetSec;  // MODIFIED 2026-08-16
       gmtime_r(&shifted, &updTm);
       char buf[40];
       snprintf(buf, sizeof(buf), "Last Updated: %02d:%02d, %02d/%02d/%04d",
@@ -3367,21 +3486,70 @@ void setup(){
             // through that same form -- holding down on either row
             // launches identical setup.
             startProvisioning();
-            if (wifiConnect()) {
-              time_t nowForFetch; time(&nowForFetch);
-              int gy, gm, gd;
-              epochToLocalYMD(nowForFetch, &gy, &gm, &gd);
-              fetchZmanim(gy,gm,gd);
-              fetchHebrewDate(gy,gm,gd);
-              fetchOmerDay(gy,gm,gd);
-              if (omerDay == 0) fetchNextHoliday(gy,gm,gd,nowForFetch);
-              fetchWeather();
-              wakesSinceWeatherFetch = 0;
-              moonFrac = calcMoonFraction(gy,gm,gd);
-              haveData = true;
-              time(&lastSyncEpoch);
-              time(&lastSuccessfulUpdateEpoch);
-              wifiOff();
+            // ---- BUG FIX 2026-08-16: THE ROOT CAUSE OF THE COLORADO ----
+            // "watch frozen after changing WiFi settings" FAILURE.
+            //
+            // This block used to hand-roll its own post-provisioning
+            // re-fetch: wifiConnect(), then time(), then
+            // epochToLocalYMD() on that timestamp, then fetch everything
+            // for the resulting date, then unconditionally set
+            // haveData = true and stamp lastSyncEpoch/
+            // lastSuccessfulUpdateEpoch. It was the ONLY fetch path in
+            // this file with no configTime() call and no NTP wait --
+            // attemptInitialDataFetch() has both, and refuses to report
+            // success unless getLocalTime() comes back with a year >= 2025.
+            //
+            // That omission is harmless only when the clock already
+            // happens to be correct. It is catastrophic in exactly the
+            // situation this row exists to rescue: a fresh boot whose
+            // initial fetch FAILED (wrong SSID after travelling), where
+            // the RTC is still sitting at 1970 because NTP has never
+            // succeeded this power cycle. In that state, this code
+            // computed gy/gm/gd = 1970-01-01, fetched zmanim for that
+            // date, derived moonFrac from it, and then declared the whole
+            // thing a success.
+            //
+            // The damage was self-reinforcing rather than self-healing,
+            // because haveData = true is precisely the flag that GATES
+            // the retry-with-backoff block further down (`if (!haveData
+            // && !freshBoot)`). So the one action the user takes to fix a
+            // broken watch was the action that permanently disabled the
+            // mechanism designed to recover it. The watch then sat
+            // rendering 1970 zmanim forever, never retrying.
+            //
+            // Confirmed against a real captured wake log, final three
+            // records:
+            //   1751  button  syncBefore=1751 syncAfter=1751
+            //         syncFresh=yes battPct=100 moonFrac=0.749
+            // The log's first column IS nowUTC. A "successful sync" whose
+            // timestamp equals ~29 minutes-since-boot is not a sync; and
+            // moonFrac had been pinned at 0.000 through every preceding
+            // unsynced wake before jumping to 0.749 at this exact moment
+            // -- 0.749 being what calcMoonFraction() returns for
+            // 1970-01-01, not anything to do with the actual sky.
+            //
+            // Fix: call the shared attemptInitialDataFetch(), which does
+            // WiFi -> configTime -> NTP-with-year-check -> zmanim ->
+            // Hebrew date -> omer -> holiday/parasha -> weather ->
+            // moonFrac -> Torah CSV -> wifiOff, and sets haveData /
+            // lastSyncEpoch / lastSuccessfulUpdateEpoch ONLY on real
+            // success. Fetch order there is already correct for a
+            // location change: fetchZmanim() refreshes currentLatitude/
+            // currentLongitude from Hebcal's response before
+            // fetchWeather() consumes them, so weather follows the new
+            // zip automatically. It also now captures the new location's
+            // real UTC offset (see localUtcOffsetSec).
+            //
+            // Two deliberate behavior improvements come along with the
+            // consolidation: fetchNextHoliday() now always runs here
+            // (the old code skipped it whenever omerDay != 0, leaving the
+            // parasha name stale after a move), and the Torah quotes CSV
+            // is refreshed too.
+            if (attemptInitialDataFetch()) {
+              Serial.println("Post-provisioning fetch succeeded");
+              dataFetchRetryCount = 0;
+            } else {
+              Serial.println("Post-provisioning fetch failed -- backoff retry will keep trying");
             }
           } else if (settingsCursor == 11) {
             // Serve Debug Log, shifted from cursor 10 to 11 to make
@@ -3464,19 +3632,45 @@ void setup(){
   // and in attemptInitialDataFetch()'s caller in the freshBoot block
   // above).
   if (!haveData && !freshBoot) {
+    // ---- NEW 2026-08-16: third "idle" backoff tier ----
+    // The original two-tier schedule bottomed out at one retry every 5
+    // wakes and stayed there FOREVER -- there was no give-up tier. A real
+    // captured log shows the consequence directly: over an 18-hour
+    // stretch out of WiFi range, `retry=attempted/failed` recurs every
+    // fifth record without pause, ~12 radio spin-ups per hour, while
+    // battPct walks 100 -> 80. That is roughly 1.1%/hour, i.e. a ~4-day
+    // life spent entirely on retries that cannot possibly succeed
+    // (wrong/absent network). Travelling is exactly when that matters
+    // most and exactly when it used to be worst.
+    //
+    // After IDLE_AFTER_COUNT wakes (~1 hour of trying) the schedule drops
+    // to once an hour. Nothing about responsiveness is lost: a button
+    // press still renders immediately, and holding DOWN on the WiFi/Zip
+    // row still forces a full re-fetch on the spot -- so the user-driven
+    // recovery path is unaffected, only the pointless background polling
+    // slows down.
     const int FAST_RETRY_COUNT = 5;
     const int SLOW_RETRY_INTERVAL_WAKES = 5;
+    const int IDLE_AFTER_COUNT = 65;            // ~1 hour at 1 wake/minute
+    const int IDLE_RETRY_INTERVAL_WAKES = 60;   // then once per hour
     bool shouldRetryNow;
+    const char* retryPhase;
     if (dataFetchRetryCount < FAST_RETRY_COUNT) {
       shouldRetryNow = true;
-    } else {
+      retryPhase = "fast";
+    } else if (dataFetchRetryCount < IDLE_AFTER_COUNT) {
       int wakesSinceFastPhase = dataFetchRetryCount - FAST_RETRY_COUNT;
       shouldRetryNow = (wakesSinceFastPhase % SLOW_RETRY_INTERVAL_WAKES) == 0;
+      retryPhase = "slow";
+    } else {
+      int wakesSinceFastPhase = dataFetchRetryCount - FAST_RETRY_COUNT;
+      shouldRetryNow = (wakesSinceFastPhase % IDLE_RETRY_INTERVAL_WAKES) == 0;
+      retryPhase = "idle";
     }
 
     if (shouldRetryNow) {
       Serial.printf("Retrying initial data fetch (attempt count=%d, %s phase)\n",
-        dataFetchRetryCount, dataFetchRetryCount < FAST_RETRY_COUNT ? "fast" : "slow");
+        dataFetchRetryCount, retryPhase);
       bool retryOk = attemptInitialDataFetch();
       if (retryOk) {
         Serial.println("Retry succeeded -- data fetch recovered");
@@ -3493,12 +3687,23 @@ void setup(){
         logRetry = "attempted/failed";
       }
     } else {
-      logRetry = "skipped(backoff)";
+      // Record WHICH phase we're backing off in, so the wake log makes the
+      // schedule visible rather than showing an undifferentiated
+      // "skipped(backoff)" for hours on end.
+      logRetry = String("skipped(") + retryPhase + ")";
     }
     dataFetchRetryCount++;
   }
 
-  if (haveData && nowUTC > sunsetEpoch) {
+  // MODIFIED 2026-08-16: added the clockIsSynced() guard. Without it, an
+  // unsynced clock (time() still near 0 after a power loss) compared
+  // against a stale, large sunsetEpoch silently suppresses the rollover
+  // forever; and the mirror-image case would stamp lastSyncEpoch /
+  // lastSuccessfulUpdateEpoch from a 1970 clock, reproducing the same
+  // false-success signature this session's main fix removes from the
+  // provisioning path. If the clock isn't real, no epoch comparison in
+  // this block means anything, so don't make one.
+  if (haveData && clockIsSynced() && nowUTC > sunsetEpoch) {
     Serial.println("Past sunset — Jewish day rolled over, re-fetching");
     time_t oldSunset = sunsetEpoch;
     bool rolloverOk = false;
@@ -3585,6 +3790,14 @@ void setup(){
       "\tsyncBefore=" + String((long)lastSyncBefore) +
       "\tsyncAfter=" + String((long)lastSyncEpoch) +
       "\tsyncFresh=" + (syncFresh ? "yes" : "no") +
+      // NEW 2026-08-16: an explicit "is the RTC holding real wall-clock
+      // time?" field. The timestamp column already implies this (a value
+      // of 1751 obviously isn't a 2026 epoch), but only if you happen to
+      // notice -- and not noticing is precisely what let the false
+      // syncFresh=yes go unread in the last captured log. Making it a
+      // named field means the next diagnosis is a grep, not an inference.
+      "\tclockOk=" + (clockIsSynced() ? "yes" : "no") +
+      "\tutcOffset=" + String(localUtcOffsetSec) +
       "\tbattPct=" + String(battPct) +
       "\tmoonFrac=" + String(moonFrac, 3);
     wakeLogAppend(line);
