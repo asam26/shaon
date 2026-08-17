@@ -14,6 +14,7 @@
 #include <LittleFS.h>
 #include <esp_partition.h>
 #include "shaon_fonts.h"
+#include "shaon_paleo.h"
 
 Preferences prefs;
 
@@ -106,31 +107,63 @@ RTC_DATA_ATTR long localUtcOffsetSec = -7 * 3600;
 static bool clockIsSynced() { time_t t; time(&t); return t >= MIN_PLAUSIBLE_EPOCH; }
 
 #define WAKE_INTERVAL_SECONDS 60
-// ---- Button pins and roles (REMAPPED 2026-07-13) ----
+// ---- Button pins and roles (REMAPPED 2026-08-16) ----
 // Physical corner positions, per the original hardware layout:
 //   MENU_BTN_PIN (7) = bottom-left
 //   BACK_BTN_PIN (6) = top-left
 //   UP_BTN_PIN   (0) = top-right
 //   DOWN_BTN_PIN (8) = bottom-right
-// Roles as of this remapping (see the wake-handling block in setup()
-// for the actual logic):
-//   Top-right (UP_BTN_PIN)    -> cycle FORWARD through screens (was
-//                                 previously MENU's job before the swap)
-//   Top-left  (BACK_BTN_PIN)  -> cycle BACKWARD through screens
-//                                 (unchanged)
-//   Bottom-left (MENU_BTN_PIN)-> TAP: force a screen refresh. HOLD
-//                                 (>=600ms): toggle Hebrew/English
-//                                 globally, from any screen (was
-//                                 previously UP's refresh-only job
-//                                 before the swap; the hold-to-toggle
-//                                 behavior is new)
-//   Bottom-right (DOWN_BTN_PIN)-> Settings-only: TAP moves the row
-//                                 cursor forward, HOLD toggles the
-//                                 selected row (unchanged)
+//
+// This is the third remap of this project. The previous arrangement put screen
+// cycling on the TOP pair and left the bottom pair doing unrelated jobs, which
+// meant DOWN (bottom-right) was the sole operator of the Settings screen --
+// cursor movement AND row activation both lived there. That made Settings
+// impossible to reach once the bottom pair was reassigned. Splitting the
+// Settings cursor across the two TOP buttons (up/down) fixes that properly
+// rather than carving out an exception: Settings now has a real directional
+// pair, and the bottom pair stays a consistent way out of any screen.
+//
+// SCREENS 1-6 (currentScreen 0-5):
+//   bottom-left  (MENU) -> TAP: previous screen
+//   bottom-right (DOWN) -> TAP: next screen
+//   top-left     (BACK) -> TAP: force a full refresh. No hold behaviour.
+//   top-right    (UP)   -> TAP: toggle Hebrew/English globally
+//                          HOLD >= SHIVITI_HOLD_MS: open shiviti mode
+//
+// SETTINGS (currentScreen 6):
+//   bottom-left  (MENU) -> TAP: previous screen (leaves Settings)
+//   bottom-right (DOWN) -> TAP: next screen (leaves Settings)
+//   top-left     (BACK) -> TAP: cursor UP    HOLD: activate the selected row
+//   top-right    (UP)   -> TAP: cursor DOWN  HOLD: activate the selected row
+//   Note: the shiviti gesture is NOT available from Settings, since top-right
+//   hold means "activate row" here. Step off Settings first.
+//
+// SHIVITI MODE (shivitiMode == true, overrides everything above):
+//   top-left     (BACK) -> previous page
+//   top-right    (UP)   -> next page
+//   bottom-left  (MENU) -> dismiss, return to screenBeforeShiviti
+//   bottom-right (DOWN) -> dismiss, return to screenBeforeShiviti
+//
+// The language toggle moved from a HOLD to a TAP in this remap. That makes it
+// the only button with a persistent side effect (it writes NVS on every
+// press); the other three are all harmless. Worth remembering if accidental
+// toggles become a nuisance in real use.
 #define MENU_BTN_PIN 7
 #define BACK_BTN_PIN 6
 #define UP_BTN_PIN   0
 #define DOWN_BTN_PIN 8
+// ---- Hold thresholds (2026-08-16) ----
+// Two different durations on purpose. SETTINGS_HOLD_MS is the existing
+// press-and-select feel on the Settings rows. SHIVITI_HOLD_MS is deliberately
+// long: top-right is also the language toggle, so entering the shiviti has to
+// be unmistakably intentional and impossible to hit by accident.
+//
+// Both are polled with pollHold(), which returns as soon as the button is
+// released. That matters: a release before the threshold counts as a TAP, so
+// there is no dead zone where a hesitant 1.5s press does nothing at all.
+#define SETTINGS_HOLD_MS 600
+#define SHIVITI_HOLD_MS  4000
+
 #define BTN_PIN_MASK ((1ULL<<MENU_BTN_PIN)|(1ULL<<BACK_BTN_PIN)|(1ULL<<UP_BTN_PIN)|(1ULL<<DOWN_BTN_PIN))
 
 // ---- DEBUG: force provisioning on fresh boot (TEST COMPLETE, DISABLED) ----
@@ -143,6 +176,26 @@ IPAddress SETUP_AP_IP(192, 168, 4, 1);
 // ---- Screen navigation ----
 #define NUM_SCREENS 7
 RTC_DATA_ATTR int currentScreen = 0;   // survives deep sleep, resets on power loss
+
+// ---- Shiviti mode (2026-08-16) ----
+// A modal overlay, entered by holding top-right for SHIVITI_HOLD_MS from any
+// screen except Settings. Page 0 is the shiviti itself; pages 1..22 are the
+// Hebrew letters, alef..tav. It is NOT part of the currentScreen rotation --
+// it sits on top of whatever screen was showing, and dismissing it returns
+// there, which is why screenBeforeShiviti exists.
+//
+// All three must survive deep sleep: the watch sleeps between every single
+// button press, so a plain global would reset the mode a minute after it was
+// entered. (Same root cause as the 2026-07-13 zip-code bug.)
+RTC_DATA_ATTR bool shivitiMode = false;
+RTC_DATA_ATTR int  shivitiIndex = 0;          // 0 = shiviti, 1..22 = alef..tav
+RTC_DATA_ATTR int  screenBeforeShiviti = 0;   // where to return on dismiss
+#define SHIVITI_LAST_PAGE 22
+// 23 pages total: the shiviti itself plus alef..tav. Paging WRAPS in both
+// directions rather than clamping, so top-left from the shiviti lands on tav
+// and walks the alphabet backwards. Clamping made top-left a dead button on
+// page 0, which read as broken.
+#define SHIVITI_PAGE_COUNT (SHIVITI_LAST_PAGE + 1)
 
 // ---- Display / pins ----
 #define DISPLAY_CS 33
@@ -3240,8 +3293,183 @@ void drawSettings() {
   u8g2Fonts.print("DOWN: move    HOLD: toggle");
 }
 
+// ---- Button hold polling (2026-08-16) ----
+// Returns true only if the button is still held after thresholdMs. Returns
+// EARLY on release, so a tap costs no wall-clock time and, critically, any
+// release before the threshold is reported as a tap rather than falling into
+// a dead zone where neither the tap action nor the hold action fires.
+bool pollHold(int pin, unsigned long thresholdMs) {
+  pinMode(pin, INPUT_PULLUP);
+  unsigned long start = millis();
+  while (digitalRead(pin) == LOW && (millis() - start) < thresholdMs) {
+    delay(20);
+  }
+  return (millis() - start) >= thresholdMs;
+}
+
+// Deep sleep re-arms EXT1 with ESP_EXT1_WAKEUP_ANY_LOW, so a button still
+// being held when we sleep wakes the chip again immediately. After a HOLD
+// action that matters: releasing a 4-second press takes a moment, and without
+// this the watch would wake straight back up and read the release as a fresh
+// tap -- opening the shiviti and then instantly paging forward. Bounded by a
+// timeout so a physically stuck button can't hang the wake.
+void waitForRelease(int pin, unsigned long timeoutMs) {
+  pinMode(pin, INPUT_PULLUP);
+  unsigned long start = millis();
+  while (digitalRead(pin) == LOW && (millis() - start) < timeoutMs) {
+    delay(20);
+  }
+}
+
+// ---- Always-RTL print helpers (2026-08-16) ----
+// printHebrewCentered()/printHebrewRight() deliberately SKIP the RTL reversal
+// when languageEnglish is true, because everywhere else in this file they are
+// handed a Hebrew string only in Hebrew mode and an English string in English
+// mode. Shiviti mode is the exception: its text is Hebrew in BOTH language
+// modes -- the shiviti is a sacred text, not interface chrome to be
+// translated, and the letter names are the Hebrew names of Hebrew letters.
+// Routing them through the language-conditional helpers would have rendered
+// every one of them mirrored for anyone with English selected. These variants
+// always reverse.
+void printHebrewCenteredRTL(const char* s, int cx, int y) {
+  String r = reverseUTF8(s);
+  int w = u8g2Fonts.getUTF8Width(r.c_str());
+  u8g2Fonts.setCursor(cx - w/2, y); u8g2Fonts.print(r);
+}
+void printHebrewRightRTL(const char* s, int rx, int y) {
+  String r = reverseUTF8(s);
+  int w = u8g2Fonts.getUTF8Width(r.c_str());
+  u8g2Fonts.setCursor(rx - w, y); u8g2Fonts.print(r);
+}
+
+// ============================================================
+// Shiviti mode page 0 -- the shiviti itself
+// ============================================================
+// Three unpointed lines. Dropping the nikkud was a design decision, but it
+// also removed the only real technical obstacle here: every glyph in
+// "shiviti / YHVH / l'negdi tamid" is a plain Hebrew letter, so this renders
+// with the existing frankruhl_hebrew_* fonts and needs no bitmap at all.
+// (With nikkud it would have had to be a pre-rendered 200x200 XBM, because
+// u8g2 advances by glyph width and cannot stack combining marks.)
+//
+// Vertical placement was derived by measuring real ink bounds in the 200x200
+// mockup rather than by guessing font metrics -- the same reason this file
+// uses getFontAscent()/getFontDescent() elsewhere instead of trusting font
+// metadata. If you swap either font size, re-centre against measured ink, do
+// not just nudge the baselines.
+void drawShivitiScreen() {
+  display.fillScreen(GxEPD_WHITE);
+
+  // Corner brackets, matching the HUD framing used across the other screens.
+  const int in = 6, arm = 17;
+  for (int c = 0; c < 4; c++) {
+    int x = (c & 1) ? 200 - in : in;
+    int y = (c & 2) ? 200 - in : in;
+    int dx = (c & 1) ? -arm : arm;
+    int dy = (c & 2) ? -arm : arm;
+    display.drawLine(x, y, x + dx, y, GxEPD_BLACK);
+    display.drawLine(x, y, x, y + dy, GxEPD_BLACK);
+    display.drawLine(x, y + (dy > 0 ? 1 : -1), x + dx, y + (dy > 0 ? 1 : -1), GxEPD_BLACK);
+    display.drawLine(x + (dx > 0 ? 1 : -1), y, x + (dx > 0 ? 1 : -1), y + dy, GxEPD_BLACK);
+  }
+  display.drawRect(14, 14, 172, 172, GxEPD_BLACK);
+
+  u8g2Fonts.setFont(frankruhl_hebrew_18);
+  printHebrewCenteredRTL("שויתי", 100, 74);
+
+  u8g2Fonts.setFont(frankruhl_hebrew_42);
+  printHebrewCenteredRTL("יהוה", 100, 126);
+
+  u8g2Fonts.setFont(frankruhl_hebrew_18);
+  printHebrewCenteredRTL("לנגדי תמיד", 100, 166);
+}
+
+// ============================================================
+// Shiviti mode pages 1..22 -- one Hebrew letter each
+// ============================================================
+// Square letter large and centred, a 22-segment position bar along the top,
+// the paleo form bottom-left and the letter's name bottom-right.
+//
+// The paleo glyphs are the one part that genuinely cannot come from a font:
+// no u8g2 font covers the Unicode Phoenician block, so they ship as XBM data
+// in shaon_paleo.h (2288 bytes for all 22). Note drawXBitmap, not drawBitmap
+// -- XBM is LSB-first within each byte and drawBitmap would render every
+// glyph mirrored.
+//
+// SIZE NOTE: frankruhl_hebrew_42 is the largest Hebrew font currently built,
+// so the letter renders at 42px where the mockup used ~118px. It is legible
+// but nothing like as commanding. Building one more font at ~96px, subset to
+// just these 22 glyphs, is the single highest-value follow-up here; swap the
+// setFont() call below and re-centre.
+static const char* const SHIVITI_LETTERS[22] = {
+  "א","ב","ג","ד","ה","ו","ז","ח","ט","י","כ","ל",
+  "מ","נ","ס","ע","פ","צ","ק","ר","ש","ת"
+};
+static const char* const SHIVITI_LETTER_NAMES[22] = {
+  "אלף","בית","גימל","דלת","הא","וו","זין","חית","טית","יוד","כף","למד",
+  "מם","נון","סמך","עין","פא","צדי","קוף","ריש","שין","תו"
+};
+
+void drawShivitiLetter(int i) {
+  if (i < 0 || i > 21) return;
+  display.fillScreen(GxEPD_WHITE);
+
+  const int in = 6, arm = 14;
+  for (int c = 0; c < 4; c++) {
+    int x = (c & 1) ? 200 - in : in;
+    int y = (c & 2) ? 200 - in : in;
+    int dx = (c & 1) ? -arm : arm;
+    int dy = (c & 2) ? -arm : arm;
+    display.drawLine(x, y, x + dx, y, GxEPD_BLACK);
+    display.drawLine(x, y, x, y + dy, GxEPD_BLACK);
+  }
+
+  // Position bar: 22 segments, filled through the current letter. This encodes
+  // real information (where you are in the alphabet), which is why it earns
+  // the space -- it is not decoration.
+  const int x0 = 22, x1 = 178;
+  const float segW = (float)(x1 - x0 - 21 * 2) / 22.0f;
+  for (int k = 0; k < 22; k++) {
+    int x = x0 + (int)(k * (segW + 2));
+    if (k <= i) display.fillRect(x, 20, (int)segW + 1, 3, GxEPD_BLACK);
+    else        display.drawLine(x, 21, x + (int)segW, 21, GxEPD_BLACK);
+  }
+
+  // FONT BUMP 2026-08-17: frankruhl_hebrew_42 -> frankruhl_hebrew_68.
+  // Baseline y=115 is derived from measured per-glyph BDF boxes, not chosen
+  // by eye: the typical Hebrew letter in this font is 55px above baseline
+  // and does not descend, so centring 55px of ink in the 129px band between
+  // the position bar (y=23) and footer rule (y=152) puts the baseline at
+  // (23+152)/2 + 55/2 = 115. Verified the outliers clear both edges at that
+  // baseline -- lamed is the tallest at 76px above (tops out at y=39, clear
+  // of the bar) and qof the deepest at 15px below (bottoms at y=130, clear
+  // of the rule). Yod floats 24-55px above baseline, which is correct for
+  // that letter and is why the median rather than the font-wide ascent
+  // drives this number.
+  u8g2Fonts.setFont(frankruhl_hebrew_68);
+  printHebrewCenteredRTL(SHIVITI_LETTERS[i], 100, 115);
+
+  display.drawLine(14, 152, 186, 152, GxEPD_BLACK);
+
+  // Paleo form, bottom-left.
+  const unsigned char* glyph =
+    (const unsigned char*)pgm_read_ptr(&PALEO_GLYPHS[i]);
+  display.drawXBitmap(20, 158, glyph, PALEO_W, PALEO_H, GxEPD_BLACK);
+
+  // Name, bottom-right.
+  u8g2Fonts.setFont(frankruhl_hebrew_18);
+  printHebrewRightRTL(SHIVITI_LETTER_NAMES[i], 182, 182);
+}
+
 // ---- Screen dispatch ----
 void drawCurrentScreen(time_t now, const String& heroTime, int battPct, bool syncFresh, bool charging) {
+  // Shiviti mode is an overlay, not a member of the screen rotation, so it is
+  // checked before currentScreen is consulted at all.
+  if (shivitiMode) {
+    if (shivitiIndex == 0) drawShivitiScreen();
+    else                   drawShivitiLetter(shivitiIndex - 1);
+    return;
+  }
   switch (currentScreen) {
     case 0:  drawScreen1(now, heroTime, battPct, syncFresh, charging); break;
     case 1:  drawHalachicAnalog(now, battPct, charging); break;
@@ -3343,6 +3571,140 @@ bool attemptInitialDataFetch() {
   return false;
 }
 
+// ---- Settings row activation, extracted 2026-08-16 ----
+// Previously inlined inside DOWN's hold branch, which made DOWN the only
+// button that could operate Settings at all. Now that BOTH top buttons can
+// activate the selected row (top-left and top-right hold), this needs to be
+// callable from two places -- so it lives here rather than being duplicated.
+// The body is unchanged from the original; only the indentation moved.
+// ---- Sleep tail, extracted 2026-08-16 ----
+// Factored out of the bottom of setup() so the shiviti-mode timer-wake
+// shortcut can reach it without duplicating the wake-source configuration.
+// Arming both sources every time is what keeps buttons responsive: EXT1 on
+// ANY_LOW for the four buttons, plus a timer aligned to the next wall-clock
+// minute boundary.
+void goToSleepUntilNextMinute() {
+  pinMode(MENU_BTN_PIN,INPUT_PULLUP);
+  pinMode(BACK_BTN_PIN,INPUT_PULLUP);
+  pinMode(UP_BTN_PIN,INPUT_PULLUP);
+  pinMode(DOWN_BTN_PIN,INPUT_PULLUP);
+  Serial.flush();
+  time_t nowForSleep; time(&nowForSleep);
+  struct tm stm; localtime_r(&nowForSleep, &stm);
+  int secsToNextMin = 60 - stm.tm_sec;
+  if (secsToNextMin <= 0) secsToNextMin = 60;
+  esp_sleep_enable_timer_wakeup((uint64_t)secsToNextMin * 1000000ULL);
+  esp_sleep_enable_ext1_wakeup(BTN_PIN_MASK, ESP_EXT1_WAKEUP_ANY_LOW);
+  esp_deep_sleep_start();
+}
+
+void activateSettingsRow() {
+  Serial.printf("Settings row %d activated\n", settingsCursor);
+    if (settingsCursor == 0) {
+      languageEnglish = !languageEnglish;
+      prefs.putBool("lang", languageEnglish);
+    } else if (settingsCursor == 1) {
+      tempFahrenheit = !tempFahrenheit;
+      prefs.putBool("tempF", tempFahrenheit);
+      if (wifiConnect()) {
+        fetchWeather();
+        wifiOff();
+      }
+      wakesSinceWeatherFetch = 0;
+    } else if (settingsCursor == 2) {
+      zmanimMethodMGA = !zmanimMethodMGA;
+      prefs.putBool("mga", zmanimMethodMGA);
+    } else if (settingsCursor >= 3 && settingsCursor <= 8) {
+      int idx = settingsCursor - 3;
+      screenEnabled[idx] = !screenEnabled[idx];
+      char key[8]; snprintf(key, sizeof(key), "scr%d", idx);
+      prefs.putBool(key, screenEnabled[idx]);
+    } else if (settingsCursor == 9 || settingsCursor == 10) {
+      // REAL BUG FIX 2026-07-13: Zip is now its OWN real cursor
+      // stop (10), not just a display line squeezed between WiFi
+      // (9) and Serve Debug Log -- previously the cursor could
+      // only ever be 9 or 10 (old Serve Debug Log slot), meaning
+      // it was IMPOSSIBLE to land the cursor on the Zip row at
+      // all; you could only scroll PAST it while moving between
+      // WiFi and Serve Debug Log, exactly matching Andrew's
+      // report ("it only renders after you scroll past it").
+      // Both WiFi (9) and Zip (10) now trigger the same
+      // WiFi/Location setup captive portal, since zip code is set
+      // through that same form -- holding down on either row
+      // launches identical setup.
+      startProvisioning();
+      // ---- BUG FIX 2026-08-16: THE ROOT CAUSE OF THE COLORADO ----
+      // "watch frozen after changing WiFi settings" FAILURE.
+      //
+      // This block used to hand-roll its own post-provisioning
+      // re-fetch: wifiConnect(), then time(), then
+      // epochToLocalYMD() on that timestamp, then fetch everything
+      // for the resulting date, then unconditionally set
+      // haveData = true and stamp lastSyncEpoch/
+      // lastSuccessfulUpdateEpoch. It was the ONLY fetch path in
+      // this file with no configTime() call and no NTP wait --
+      // attemptInitialDataFetch() has both, and refuses to report
+      // success unless getLocalTime() comes back with a year >= 2025.
+      //
+      // That omission is harmless only when the clock already
+      // happens to be correct. It is catastrophic in exactly the
+      // situation this row exists to rescue: a fresh boot whose
+      // initial fetch FAILED (wrong SSID after travelling), where
+      // the RTC is still sitting at 1970 because NTP has never
+      // succeeded this power cycle. In that state, this code
+      // computed gy/gm/gd = 1970-01-01, fetched zmanim for that
+      // date, derived moonFrac from it, and then declared the whole
+      // thing a success.
+      //
+      // The damage was self-reinforcing rather than self-healing,
+      // because haveData = true is precisely the flag that GATES
+      // the retry-with-backoff block further down (`if (!haveData
+      // && !freshBoot)`). So the one action the user takes to fix a
+      // broken watch was the action that permanently disabled the
+      // mechanism designed to recover it. The watch then sat
+      // rendering 1970 zmanim forever, never retrying.
+      //
+      // Confirmed against a real captured wake log, final three
+      // records:
+      //   1751  button  syncBefore=1751 syncAfter=1751
+      //         syncFresh=yes battPct=100 moonFrac=0.749
+      // The log's first column IS nowUTC. A "successful sync" whose
+      // timestamp equals ~29 minutes-since-boot is not a sync; and
+      // moonFrac had been pinned at 0.000 through every preceding
+      // unsynced wake before jumping to 0.749 at this exact moment
+      // -- 0.749 being what calcMoonFraction() returns for
+      // 1970-01-01, not anything to do with the actual sky.
+      //
+      // Fix: call the shared attemptInitialDataFetch(), which does
+      // WiFi -> configTime -> NTP-with-year-check -> zmanim ->
+      // Hebrew date -> omer -> holiday/parasha -> weather ->
+      // moonFrac -> Torah CSV -> wifiOff, and sets haveData /
+      // lastSyncEpoch / lastSuccessfulUpdateEpoch ONLY on real
+      // success. Fetch order there is already correct for a
+      // location change: fetchZmanim() refreshes currentLatitude/
+      // currentLongitude from Hebcal's response before
+      // fetchWeather() consumes them, so weather follows the new
+      // zip automatically. It also now captures the new location's
+      // real UTC offset (see localUtcOffsetSec).
+      //
+      // Two deliberate behavior improvements come along with the
+      // consolidation: fetchNextHoliday() now always runs here
+      // (the old code skipped it whenever omerDay != 0, leaving the
+      // parasha name stale after a move), and the Torah quotes CSV
+      // is refreshed too.
+      if (attemptInitialDataFetch()) {
+        Serial.println("Post-provisioning fetch succeeded");
+        dataFetchRetryCount = 0;
+      } else {
+        Serial.println("Post-provisioning fetch failed -- backoff retry will keep trying");
+      }
+    } else if (settingsCursor == 11) {
+      // Serve Debug Log, shifted from cursor 10 to 11 to make
+      // room for Zip's new real cursor slot at 10.
+      startLogServer();
+    }
+}
+
 void setup(){
   Serial.begin(115200);
   esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
@@ -3352,6 +3714,23 @@ void setup(){
     delay(3000);
   } else {
     delay(200);
+  }
+
+  // ---- Shiviti mode: skip timer wakes entirely (2026-08-16) ----
+  // E-paper holds its last frame with zero power and the shiviti pages are
+  // completely static, so a once-a-minute wake has nothing to redraw. Bailing
+  // out here before display init, WiFi, fetching and logging is what keeps the
+  // mode from costing anything: a full refresh is ~2s of active draw, and at
+  // one per minute that would dwarf the normal duty cycle for a screen whose
+  // whole purpose is to be left alone and looked at.
+  //
+  // Deliberate consequence: no clock updates while the shiviti is up. The mode
+  // persists until dismissed with a bottom button -- there is no idle timeout.
+  // Button wakes (ESP_SLEEP_WAKEUP_EXT1) fall through normally, so the mode
+  // stays fully responsive.
+  if (shivitiMode && wake == ESP_SLEEP_WAKEUP_TIMER) {
+    Serial.println("Shiviti mode: timer wake, nothing to redraw -- back to sleep");
+    goToSleepUntilNextMinute();
   }
 
   {
@@ -3383,186 +3762,100 @@ void setup(){
   if (wake == ESP_SLEEP_WAKEUP_EXT1) {
     uint64_t wakeStatus = esp_sleep_get_ext1_wakeup_status();
 
-    // ---- BUTTON REMAPPING 2026-07-13 ----
-    // Per Andrew's request: top-right (UP_BTN_PIN) and bottom-left
-    // (MENU_BTN_PIN) have swapped roles. UP_BTN_PIN now cycles forward
-    // through screens (previously MENU's job). MENU_BTN_PIN now does a
-    // plain refresh on tap, PLUS a new hold-to-toggle-language feature
-    // (previously UP was refresh-only, with no hold behavior at all).
-    // BACK_BTN_PIN (top-left, cycle backward) and DOWN_BTN_PIN
-    // (bottom-right, Settings-only) are both unchanged.
-    if (wakeStatus & (1ULL << UP_BTN_PIN)) {
-      int next = currentScreen;
-      for (int tries = 0; tries < NUM_SCREENS; tries++) {
-        next = (next + 1) % NUM_SCREENS;
-        if (next == 6 || screenEnabled[next]) break;
+    if (shivitiMode) {
+      // ---- SHIVITI MODE ----
+      // Intercepts every button. Top pair pages through shiviti -> alef .. tav;
+      // either bottom button dismisses and restores the screen that was showing
+      // when the mode was entered. No hold behaviour anywhere in here: a long
+      // press on the top pair is simply a page turn, so holding top-right does
+      // not re-enter the mode it is already in.
+      if (wakeStatus & (1ULL << BACK_BTN_PIN)) {
+        shivitiIndex = (shivitiIndex + SHIVITI_PAGE_COUNT - 1) % SHIVITI_PAGE_COUNT;
+        screenChanged = true;
+        Serial.printf("Shiviti: top-left -> page %d\n", shivitiIndex);
+      } else if (wakeStatus & (1ULL << UP_BTN_PIN)) {
+        shivitiIndex = (shivitiIndex + 1) % SHIVITI_PAGE_COUNT;
+        screenChanged = true;
+        Serial.printf("Shiviti: top-right -> page %d\n", shivitiIndex);
+      } else if (wakeStatus & ((1ULL << MENU_BTN_PIN) | (1ULL << DOWN_BTN_PIN))) {
+        shivitiMode = false;
+        shivitiIndex = 0;
+        currentScreen = screenBeforeShiviti;
+        screenChanged = true;
+        Serial.printf("Shiviti dismissed -> back to screen %d\n", currentScreen);
       }
-      currentScreen = next;
-      screenChanged = true;
-      Serial.printf("UP (top-right) pressed -> cycle forward -> screen %d\n", currentScreen);
-    }
 
-    if (wakeStatus & (1ULL << BACK_BTN_PIN)) {
-      int prev = currentScreen;
-      for (int tries = 0; tries < NUM_SCREENS; tries++) {
-        prev = (prev - 1 + NUM_SCREENS) % NUM_SCREENS;
-        if (prev == 6 || screenEnabled[prev]) break;
+    } else {
+      // ---- bottom-left: previous screen ----
+      if (wakeStatus & (1ULL << MENU_BTN_PIN)) {
+        int prev = currentScreen;
+        for (int tries = 0; tries < NUM_SCREENS; tries++) {
+          prev = (prev - 1 + NUM_SCREENS) % NUM_SCREENS;
+          if (prev == 6 || screenEnabled[prev]) break;
+        }
+        currentScreen = prev;
+        screenChanged = true;
+        Serial.printf("MENU (bottom-left) -> previous screen %d\n", currentScreen);
       }
-      currentScreen = prev;
-      screenChanged = true;
-      Serial.printf("BACK (top-left) pressed -> cycle backward -> screen %d\n", currentScreen);
-    }
 
-    if (wakeStatus & (1ULL << MENU_BTN_PIN)) {
-      // BUTTON REMAP 2026-07-14: hold-to-toggle-language moved off of
-      // MENU (bottom-left) onto DOWN (bottom-right) for screens 1-6 --
-      // see the DOWN_BTN_PIN block below. MENU is back to a simple
-      // tap-only refresh, no hold detection needed here any more.
-      forceRefreshOnly = true;
-      Serial.println("MENU (bottom-left) tapped -> forcing screen refresh");
-    }
-
-    if (wakeStatus & (1ULL << DOWN_BTN_PIN)) {
-      pinMode(DOWN_BTN_PIN, INPUT_PULLUP);
-      const unsigned long HOLD_THRESHOLD_MS = 600;
-      unsigned long pressStart = millis();
-      while (digitalRead(DOWN_BTN_PIN) == LOW &&
-             (millis() - pressStart) < HOLD_THRESHOLD_MS) {
-        delay(20);
+      // ---- bottom-right: next screen ----
+      if (wakeStatus & (1ULL << DOWN_BTN_PIN)) {
+        int next = currentScreen;
+        for (int tries = 0; tries < NUM_SCREENS; tries++) {
+          next = (next + 1) % NUM_SCREENS;
+          if (next == 6 || screenEnabled[next]) break;
+        }
+        currentScreen = next;
+        screenChanged = true;
+        Serial.printf("DOWN (bottom-right) -> next screen %d\n", currentScreen);
       }
-      bool wasHold = (millis() - pressStart) >= HOLD_THRESHOLD_MS;
 
-      // BUTTON REMAP 2026-07-14: on screens 1-6 (currentScreen 0-5),
-      // holding DOWN now does the global language toggle that used to
-      // live on MENU's hold. Tapping DOWN outside Settings remains a
-      // no-op, same as before this change. Screen 7 (Settings,
-      // currentScreen==6) is completely unchanged below: tap still
-      // scrolls the cursor, hold still performs that row's own action
-      // (which, on row 0, is ALSO a language toggle -- this is
-      // intentional and pre-existing, not a duplicate of this new
-      // behavior).
-      if (currentScreen != 6) {
-        if (wasHold) {
-          languageEnglish = !languageEnglish;
-          prefs.putBool("lang", languageEnglish);
-          screenChanged = true; // force a full redraw so the language change is visible immediately
-          Serial.printf("DOWN (bottom-right) held -> language toggled to %s\n", languageEnglish ? "English" : "Hebrew");
+      // ---- top-left: refresh, or Settings cursor UP ----
+      if (wakeStatus & (1ULL << BACK_BTN_PIN)) {
+        if (currentScreen == 6) {
+          if (pollHold(BACK_BTN_PIN, SETTINGS_HOLD_MS)) {
+            activateSettingsRow();
+            waitForRelease(BACK_BTN_PIN, 3000);
+          } else {
+            // 12 cursor stops (0-11); +11 is -1 modulo 12.
+            settingsCursor = (settingsCursor + 11) % 12;
+            Serial.printf("BACK tapped -> settings cursor up to %d\n", settingsCursor);
+          }
+          screenChanged = true;
+        } else {
+          forceRefreshOnly = true;
+          Serial.println("BACK (top-left) tapped -> forcing screen refresh");
         }
       }
 
-      if (currentScreen == 6) {
-        if (wasHold) {
-          Serial.printf("DOWN held -> action on settings row %d\n", settingsCursor);
-          if (settingsCursor == 0) {
+      // ---- top-right: language toggle / shiviti, or Settings cursor DOWN ----
+      if (wakeStatus & (1ULL << UP_BTN_PIN)) {
+        if (currentScreen == 6) {
+          if (pollHold(UP_BTN_PIN, SETTINGS_HOLD_MS)) {
+            activateSettingsRow();
+            waitForRelease(UP_BTN_PIN, 3000);
+          } else {
+            settingsCursor = (settingsCursor + 1) % 12;
+            Serial.printf("UP tapped -> settings cursor down to %d\n", settingsCursor);
+          }
+          screenChanged = true;
+        } else {
+          if (pollHold(UP_BTN_PIN, SHIVITI_HOLD_MS)) {
+            screenBeforeShiviti = currentScreen;
+            shivitiMode = true;
+            shivitiIndex = 0;
+            waitForRelease(UP_BTN_PIN, 3000);
+            Serial.printf("UP held %dms -> shiviti opened over screen %d\n",
+              SHIVITI_HOLD_MS, screenBeforeShiviti);
+          } else {
+            // Any release before SHIVITI_HOLD_MS is a tap, so there is no
+            // in-between duration that does nothing.
             languageEnglish = !languageEnglish;
             prefs.putBool("lang", languageEnglish);
-          } else if (settingsCursor == 1) {
-            tempFahrenheit = !tempFahrenheit;
-            prefs.putBool("tempF", tempFahrenheit);
-            if (wifiConnect()) {
-              fetchWeather();
-              wifiOff();
-            }
-            wakesSinceWeatherFetch = 0;
-          } else if (settingsCursor == 2) {
-            zmanimMethodMGA = !zmanimMethodMGA;
-            prefs.putBool("mga", zmanimMethodMGA);
-          } else if (settingsCursor >= 3 && settingsCursor <= 8) {
-            int idx = settingsCursor - 3;
-            screenEnabled[idx] = !screenEnabled[idx];
-            char key[8]; snprintf(key, sizeof(key), "scr%d", idx);
-            prefs.putBool(key, screenEnabled[idx]);
-          } else if (settingsCursor == 9 || settingsCursor == 10) {
-            // REAL BUG FIX 2026-07-13: Zip is now its OWN real cursor
-            // stop (10), not just a display line squeezed between WiFi
-            // (9) and Serve Debug Log -- previously the cursor could
-            // only ever be 9 or 10 (old Serve Debug Log slot), meaning
-            // it was IMPOSSIBLE to land the cursor on the Zip row at
-            // all; you could only scroll PAST it while moving between
-            // WiFi and Serve Debug Log, exactly matching Andrew's
-            // report ("it only renders after you scroll past it").
-            // Both WiFi (9) and Zip (10) now trigger the same
-            // WiFi/Location setup captive portal, since zip code is set
-            // through that same form -- holding down on either row
-            // launches identical setup.
-            startProvisioning();
-            // ---- BUG FIX 2026-08-16: THE ROOT CAUSE OF THE COLORADO ----
-            // "watch frozen after changing WiFi settings" FAILURE.
-            //
-            // This block used to hand-roll its own post-provisioning
-            // re-fetch: wifiConnect(), then time(), then
-            // epochToLocalYMD() on that timestamp, then fetch everything
-            // for the resulting date, then unconditionally set
-            // haveData = true and stamp lastSyncEpoch/
-            // lastSuccessfulUpdateEpoch. It was the ONLY fetch path in
-            // this file with no configTime() call and no NTP wait --
-            // attemptInitialDataFetch() has both, and refuses to report
-            // success unless getLocalTime() comes back with a year >= 2025.
-            //
-            // That omission is harmless only when the clock already
-            // happens to be correct. It is catastrophic in exactly the
-            // situation this row exists to rescue: a fresh boot whose
-            // initial fetch FAILED (wrong SSID after travelling), where
-            // the RTC is still sitting at 1970 because NTP has never
-            // succeeded this power cycle. In that state, this code
-            // computed gy/gm/gd = 1970-01-01, fetched zmanim for that
-            // date, derived moonFrac from it, and then declared the whole
-            // thing a success.
-            //
-            // The damage was self-reinforcing rather than self-healing,
-            // because haveData = true is precisely the flag that GATES
-            // the retry-with-backoff block further down (`if (!haveData
-            // && !freshBoot)`). So the one action the user takes to fix a
-            // broken watch was the action that permanently disabled the
-            // mechanism designed to recover it. The watch then sat
-            // rendering 1970 zmanim forever, never retrying.
-            //
-            // Confirmed against a real captured wake log, final three
-            // records:
-            //   1751  button  syncBefore=1751 syncAfter=1751
-            //         syncFresh=yes battPct=100 moonFrac=0.749
-            // The log's first column IS nowUTC. A "successful sync" whose
-            // timestamp equals ~29 minutes-since-boot is not a sync; and
-            // moonFrac had been pinned at 0.000 through every preceding
-            // unsynced wake before jumping to 0.749 at this exact moment
-            // -- 0.749 being what calcMoonFraction() returns for
-            // 1970-01-01, not anything to do with the actual sky.
-            //
-            // Fix: call the shared attemptInitialDataFetch(), which does
-            // WiFi -> configTime -> NTP-with-year-check -> zmanim ->
-            // Hebrew date -> omer -> holiday/parasha -> weather ->
-            // moonFrac -> Torah CSV -> wifiOff, and sets haveData /
-            // lastSyncEpoch / lastSuccessfulUpdateEpoch ONLY on real
-            // success. Fetch order there is already correct for a
-            // location change: fetchZmanim() refreshes currentLatitude/
-            // currentLongitude from Hebcal's response before
-            // fetchWeather() consumes them, so weather follows the new
-            // zip automatically. It also now captures the new location's
-            // real UTC offset (see localUtcOffsetSec).
-            //
-            // Two deliberate behavior improvements come along with the
-            // consolidation: fetchNextHoliday() now always runs here
-            // (the old code skipped it whenever omerDay != 0, leaving the
-            // parasha name stale after a move), and the Torah quotes CSV
-            // is refreshed too.
-            if (attemptInitialDataFetch()) {
-              Serial.println("Post-provisioning fetch succeeded");
-              dataFetchRetryCount = 0;
-            } else {
-              Serial.println("Post-provisioning fetch failed -- backoff retry will keep trying");
-            }
-          } else if (settingsCursor == 11) {
-            // Serve Debug Log, shifted from cursor 10 to 11 to make
-            // room for Zip's new real cursor slot at 10.
-            startLogServer();
+            Serial.printf("UP tapped -> language %s\n", languageEnglish ? "English" : "Hebrew");
           }
-        } else {
-          // Wraparound updated from %11 to %12 -- one more real cursor
-          // stop now that Zip is addressable (12 total: 0-11).
-          settingsCursor = (settingsCursor + 1) % 12;
-          Serial.printf("DOWN tapped -> settings cursor %d\n", settingsCursor);
+          screenChanged = true;
         }
-        screenChanged = true;
       }
     }
   }
@@ -3803,18 +4096,7 @@ void setup(){
     wakeLogAppend(line);
   }
 
-  pinMode(MENU_BTN_PIN,INPUT_PULLUP);
-  pinMode(BACK_BTN_PIN,INPUT_PULLUP);
-  pinMode(UP_BTN_PIN,INPUT_PULLUP);
-  pinMode(DOWN_BTN_PIN,INPUT_PULLUP);
-  Serial.flush();
-  time_t nowForSleep; time(&nowForSleep);
-  struct tm stm; localtime_r(&nowForSleep, &stm);
-  int secsToNextMin = 60 - stm.tm_sec;
-  if (secsToNextMin <= 0) secsToNextMin = 60;
-  esp_sleep_enable_timer_wakeup((uint64_t)secsToNextMin * 1000000ULL);
-  esp_sleep_enable_ext1_wakeup(BTN_PIN_MASK, ESP_EXT1_WAKEUP_ANY_LOW);
-  esp_deep_sleep_start();
+  goToSleepUntilNextMinute();
 }
 
 void loop(){}
